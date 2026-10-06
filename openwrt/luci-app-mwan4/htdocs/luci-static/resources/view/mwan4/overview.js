@@ -6,6 +6,63 @@
 'require form';
 'require poll';
 
+/* 容忍的时钟偏差（秒）。浏览器与路由器各自 NTP，差十几秒是常态，
+   只有差距大到无法用时差解释时才说「不可判断」。 */
+var CLOCK_SKEW_TOLERANCE_SECS = 300;
+
+/* 上一次看到的 updated_at：只要它还在变大，daemon 就是活的（不受时差影响）。 */
+var lastSeenUpdatedAt = null;
+
+/* 每张卡片的 RTT/丢包趋势：轮询时累积，只存在于本页（重新载入即清空）。 */
+var TREND_LEN = 60;
+var trendHistory = {};
+
+function history2bars(iface) {
+	var h = trendHistory[iface.name] || [];
+	var max = 50;
+	for (var i = 0; i < h.length; i++)
+		if (h[i].rtt > max) max = h[i].rtt;
+
+	// 时间由左向右，最新一笔在最右侧的已填格；还没累积到的格子留白。
+	var out = [];
+	for (var n = 0; n < TREND_LEN; n++) {
+		var s = h[n];
+		if (!s || !s.up || s.rtt === null) {
+			out.push({ pct: 0, level: s ? 'bad' : 'empty', label: s ? _('Offline (DOWN)') : '' });
+			continue;
+		}
+		var level = rttLevel(s.rtt);
+		var l = lossLevel(s.loss);
+		if (l === 'bad') level = 'bad';
+		else if (l === 'warn' && level === 'ok') level = 'warn';
+		out.push({
+			pct: Math.max(8, Math.min(100, s.rtt / max * 100)),
+			level: level,
+			label: s.rtt.toFixed(1) + ' ms / ' + s.loss.toFixed(1) + '%'
+		});
+	}
+	return out;
+}
+
+function trendEl(iface) {
+	var bars = history2bars(iface).map(function(b) {
+		return E('i', { 'class': 'mwan4-trend-bar ' + b.level, 'style': 'height:' + b.pct + '%', 'title': b.label });
+	});
+	return E('div', { 'class': 'mwan4-trend', 'data-role': 'trend' }, bars);
+}
+
+function updateTrend(el, iface) {
+	var bars = history2bars(iface);
+	for (var i = 0; i < el.children.length && i < bars.length; i++) {
+		var node = el.children[i];
+		var style = 'height:' + bars[i].pct + '%';
+		if (node.getAttribute('style') !== style) node.setAttribute('style', style);
+		var cls = 'mwan4-trend-bar ' + bars[i].level;
+		if (node.className !== cls) node.className = cls;
+		if (node.title !== bars[i].label) node.title = bars[i].label;
+	}
+}
+
 function readStatusJson() {
 	return fs.read('/tmp/mwan4_status.json').then(function(content) {
 		try {
@@ -18,9 +75,8 @@ function readStatusJson() {
 	});
 }
 
-/* 内核设备名清单：daemon 用 SO_BINDTODEVICE + if_nametoindex 都需要「内核设备名」，
-   而 UCI 里的 network interface 是逻辑名（wan/wanb…），两者经常不同名。
-   桥接（br-*）是 LAN 侧，当 WAN 用几乎一定是选错了，这里直接排除。 */
+/* 核心设备名清单：daemon 用 SO_BINDTODEVICE / if_nametoindex 都需要核心设备名，
+   而 UCI 的 network 逻辑名（wan/wanb…）经常不同名；桥接属于 LAN 侧，一律排除。 */
 function listNetdevs() {
 	return fs.list('/sys/class/net').then(function(list) {
 		return (list || []).filter(function(name) {
@@ -31,18 +87,8 @@ function listNetdevs() {
 	});
 }
 
-/* 容忍的时钟偏差（秒）：浏览器时钟落后路由器时，只有差距超过这个值才说
-   「无法判断」。实测路由器（NTP 同步）与浏览器差十几秒是常态，
-   原本用 stale_after_secs（10 秒）当门槛会把正常运作误报成 clock skew。 */
-var CLOCK_SKEW_TOLERANCE_SECS = 300;
-
-/* 上一次看到的 updated_at：用来判断 daemon 是否还在写状态档。
-   两边时钟差多少不影响这个判断——只要 updated_at 还在变大，daemon 就是活的。 */
-var lastSeenUpdatedAt = null;
-
-/* 状态档新鲜度：卡片与徽章都必须据此判断，否则 daemon 被杀掉之后
-   最后一次快照（可能刚好是两条 DOWN）会被当成即时状态一直显示。
-   回传 'fresh' | 'stale' | 'skew' | 'missing' */
+/* 状态档新鲜度：'fresh' | 'stale' | 'skew' | 'missing'。
+   daemon 被杀掉后，最后一次快照不能继续被当成即时状态显示。 */
 function freshnessOf(statusData) {
 	if (!statusData || !statusData.updated_at)
 		return 'missing';
@@ -51,27 +97,23 @@ function freshnessOf(statusData) {
 	var advanced = lastSeenUpdatedAt !== null && updated > lastSeenUpdatedAt;
 	if (lastSeenUpdatedAt === null || updated > lastSeenUpdatedAt)
 		lastSeenUpdatedAt = updated;
-	// daemon 还在推进 updated_at → 确定活著，与两边时钟差多少无关
 	if (advanced)
 		return 'fresh';
 
 	var age = Date.now() / 1000 - updated;
 	if (age > staleAfter)
 		return 'stale';
-	// 浏览器时钟落后：只有差距大到无法用「时钟偏差」解释时才说不可判断
 	if (age < -CLOCK_SKEW_TOLERANCE_SECS)
 		return 'skew';
 	return 'fresh';
 }
 
-/* status dot */
 function dot(level, role) {
 	var attr = { 'class': 'mwan4-dot ' + (level || 'muted') };
 	if (role) attr['data-role'] = role;
 	return E('i', attr);
 }
 
-/* ok / warn / bad */
 function rttLevel(ms) {
 	if (ms > 150) return 'bad';
 	if (ms > 60) return 'warn';
@@ -99,13 +141,11 @@ function runText(fresh) {
 
 function stateText(iface) {
 	if (iface.state !== 'UP') return _('Offline (DOWN)');
-	// 降级 = 仍 UP、仍探测，但已因实测丢包率超标被移出 ECMP（见 degrade_loss_threshold）
 	return iface.degraded
 		? _('Online (UP, degraded - not carrying traffic)')
 		: _('Online (UP)');
 }
 
-/* 卡片提示：资料不可信 > 本机条件错误 > 一般探针错误 > 降级 */
 function cardAlert(iface, fresh) {
 	if (fresh === 'stale')
 		return _('Status is stale: the daemon may have stopped. This is the last known state.');
@@ -125,7 +165,19 @@ function cardAlert(iface, fresh) {
 	return '';
 }
 
-/* 状态档年龄（人看得懂的形式）；时钟严重不同步时明说，不要瞎报秒数 */
+function cardClass(iface, fresh) {
+	var cls = 'mwan4-card';
+	if (iface.state !== 'UP')
+		cls += ' mwan4-card-down';
+	else if (iface.degraded)
+		cls += ' mwan4-card-degraded';
+	if (fresh === 'stale' || fresh === 'skew' || fresh === 'missing')
+		cls += ' mwan4-card-stale';
+	if (iface.local_condition)
+		cls += ' mwan4-card-local';
+	return cls;
+}
+
 function statusAgeText(statusData) {
 	if (!statusData || !statusData.updated_at)
 		return _('missing');
@@ -153,16 +205,41 @@ function routeInfo(statusData) {
 	return { level: level, text: text };
 }
 
+/* 承载线概况：全 UP 且无降级 = ok；有降级 = warn；有任何一条 DOWN = bad。 */
+function wanSummary(statusData) {
+	var list = (statusData && statusData.interfaces) ? statusData.interfaces : [];
+	var up = 0, degraded = 0;
+	for (var i = 0; i < list.length; i++) {
+		if (list[i].state === 'UP') up++;
+		if (list[i].degraded) degraded++;
+	}
+	if (!list.length)
+		return { level: 'muted', text: '0 / 0', tx: 0, rx: 0 };
+	var tx = 0, rx = 0;
+	for (var j = 0; j < list.length; j++) {
+		if (list[j].state !== 'UP') continue;
+		tx += list[j].tx_bps || 0;
+		rx += list[j].rx_bps || 0;
+	}
+	return {
+		level: up === 0 || up < list.length ? 'bad' : (degraded ? 'warn' : 'ok'),
+		text: up + ' / ' + list.length,
+		tx: tx,
+		rx: rx
+	};
+}
+
 function rttText(iface) { return iface.state === 'UP' ? iface.rtt_ms.toFixed(1) + ' ms' : '--'; }
 function jitterText(iface) { return iface.state === 'UP' ? iface.jitter_ms.toFixed(1) + ' ms' : '--'; }
 function lossText(iface) { return (iface.loss_rate || 0).toFixed(1) + '%'; }
+
 function pwText(iface) {
 	var w = 'W:' + iface.weight;
-	// 动态权重启用且与设定值不同时一并显示，方便验证品质感知分流
 	if (iface.effective_weight !== undefined && iface.effective_weight !== iface.weight)
 		w = 'W:' + iface.weight + ' \u2192 ' + iface.effective_weight;
 	return (iface.metric ? ('P:' + iface.metric + ' / ') : '') + w;
 }
+
 function formatRate(bps) {
 	if (!bps || bps < 1000) return '0 bps';
 	var units = ['Kbps', 'Mbps', 'Gbps'];
@@ -170,10 +247,10 @@ function formatRate(bps) {
 	while (v >= 1000 && i < units.length - 1) { v /= 1000; i++; }
 	return (v >= 100 ? v.toFixed(0) : v.toFixed(1)) + ' ' + units[i];
 }
+
 function rateText(iface) {
 	if (iface.state !== 'UP') return '\u2191 --  \u2193 --';
 	var text = '\u2191 ' + formatRate(iface.tx_bps) + '  \u2193 ' + formatRate(iface.rx_bps);
-	// 负载感知启用且该线设有容量时，附上利用率与是否正被下修
 	if (iface.load_pct !== undefined && iface.load_pct !== null) {
 		text += '  (' + iface.load_pct.toFixed(0) + '%';
 		if (iface.offloaded) text += ', ' + _('offloaded');
@@ -181,6 +258,7 @@ function rateText(iface) {
 	}
 	return text;
 }
+
 function policyText(statusData) {
 	var list = (statusData && statusData.policies) ? statusData.policies : [];
 	if (!list.length) return null;
@@ -189,9 +267,8 @@ function policyText(statusData) {
 	}).join(', ');
 }
 
-/* 内核「实际生效」的多路径哈希粒度（读回值，不是设定值）：
-   l3_only = 同一个目的 IP 的所有连线只会走一条 WAN，也就是视频 CDN 的多条连线
-   用不到第二条线（「多 WAN 却还是卡」最常见的成因）。 */
+/* 核心「实际生效」的哈希粒度（读回值）：l3_only 就是「同一个目的 IP 的连线
+   全挤一条 WAN」，也就是视频 CDN 卡顿最常见的成因。 */
 function hashInfo(statusData) {
 	var h = statusData && statusData.hash;
 	if (!h) return { level: 'muted', text: _('Unknown') };
@@ -204,10 +281,11 @@ function hashInfo(statusData) {
 			: _('l4: per-connection spreading')) + ' (' + detail + ')'
 	};
 }
+
 function succText(iface) { return _('Consecutive Successes: ') + iface.consecutive_successes; }
 function toText(iface) { return _('Consecutive Timeouts: ') + iface.consecutive_timeouts; }
 
-/* write only when the value really changed, so text selection survives the poll */
+/* 只在值真的变了才写 DOM，轮询才不会打断文字选取。 */
 function setText(el, txt) {
 	if (el && el.textContent !== txt) el.textContent = txt;
 }
@@ -221,11 +299,9 @@ function pick(root, role) {
 	return root ? root.querySelector('[data-role="' + role + '"]') : null;
 }
 
-/* LuCI's description row lacks the leading name cell the title row has, and
-   themes may add a ::before ghost cell to the title/data rows but not to the
-   description row; both shift every hint to the left. Pad until the first
-   description cell lines up with the first title cell, retrying while the
-   form is not attached/laid out yet (rects are all zero then). */
+/* LuCI 的描述列比标题列少一格，主题又可能只给标题/资料列加 ::before 假格，
+   两边都会让提示文字左移。量到实际位置后补空格子，直到第一格对齐；
+   form 还没挂上时 rect 全为 0，用 rAF 重试。 */
 function alignDescrRows(root, tries) {
 	var tables = root.querySelectorAll('table.cbi-section-table');
 	var pending = false;
@@ -264,49 +340,85 @@ return view.extend({
 		]);
 	},
 
+	recordTrend: function(statusData) {
+		var list = (statusData && statusData.interfaces) ? statusData.interfaces : [];
+		for (var i = 0; i < list.length; i++) {
+			var iface = list[i];
+			var h = trendHistory[iface.name] || (trendHistory[iface.name] = []);
+			h.push({
+				up: iface.state === 'UP',
+				rtt: iface.state === 'UP' ? iface.rtt_ms : null,
+				loss: iface.loss_rate || 0
+			});
+			while (h.length > TREND_LEN) h.shift();
+		}
+	},
+
 	renderStatusHeader: function(statusData) {
 		var fresh = freshnessOf(statusData);
 		var ri = routeInfo(statusData);
+		var hi = hashInfo(statusData);
+		var ws = wanSummary(statusData);
+		var pt = policyText(statusData);
 
-		return E('div', { 'id': 'mwan4_header_container', 'class': 'mwan4-header' }, [
-			E('h3', { 'class': 'mwan4-title' }, _('MWAN4 Multi-WAN Failover & Health Monitor')),
-			E('div', { 'class': 'mwan4-meta' }, [
-				E('span', { 'class': 'mwan4-meta-item' }, [
-					E('span', { 'class': 'mwan4-meta-key' }, _('Daemon:')),
-					E('span', { 'class': 'mwan4-badge' }, [
-						dot(runLevel(fresh), 'run-dot'),
-						E('span', { 'data-role': 'run-text' }, runText(fresh))
+		return E('div', { 'id': 'mwan4_header_container' }, [
+			E('div', { 'class': 'mwan4-header' }, [
+				E('div', { 'class': 'mwan4-brand' }, [
+					E('span', { 'class': 'mwan4-title' }, _('MWAN4 Load Balancing')),
+					E('span', { 'class': 'mwan4-sub' }, _('MWAN4 Multi-WAN Failover & Health Monitor'))
+				]),
+				E('div', { 'class': 'mwan4-meta' }, [
+					E('span', { 'class': 'mwan4-meta-item' }, [
+						E('span', { 'class': 'mwan4-meta-key' }, _('Daemon:')),
+						E('span', { 'class': 'mwan4-badge' }, [
+							dot(runLevel(fresh), 'run-dot'),
+							E('span', { 'data-role': 'run-text' }, runText(fresh))
+						])
+					]),
+					E('span', { 'class': 'mwan4-meta-item' }, [
+						E('span', { 'class': 'mwan4-meta-key' }, _('Kernel Default Route:')),
+						E('span', { 'class': 'mwan4-badge' }, [
+							dot(ri.level, 'route-dot'),
+							E('span', { 'data-role': 'route-text' }, ri.text)
+						])
+					]),
+					E('span', { 'class': 'mwan4-meta-item' }, [
+						E('span', { 'class': 'mwan4-meta-key' }, _('Status File:')),
+						E('span', { 'class': 'mwan4-badge' }, [
+							E('span', { 'data-role': 'age-text' }, statusAgeText(statusData))
+						])
+					]),
+					E('span', {
+						'class': 'mwan4-meta-item',
+						'data-role': 'policy-item',
+						'style': pt ? '' : 'display: none'
+					}, [
+						E('span', { 'class': 'mwan4-meta-key' }, _('Policy Routing:')),
+						E('span', { 'class': 'mwan4-badge' }, [
+							E('span', { 'data-role': 'policy-text' }, pt || '')
+						])
+					]),
+					E('span', { 'class': 'mwan4-meta-item' }, [
+						E('span', { 'class': 'mwan4-meta-key' }, _('Hash Granularity:')),
+						E('span', { 'class': 'mwan4-badge' }, [
+							dot(hi.level, 'hash-dot'),
+							E('span', { 'data-role': 'hash-text' }, hi.text)
+						])
+					])
+				])
+			]),
+			E('div', { 'class': 'mwan4-summary' }, [
+				E('div', { 'class': 'mwan4-tile' }, [
+					E('span', { 'class': 'mwan4-tile-key' }, _('WAN Status:')),
+					E('span', { 'class': 'mwan4-tile-val' }, [
+						dot(ws.level, 'wan-dot'),
+						E('span', { 'data-role': 'wan-text' }, ws.text)
 					])
 				]),
-				E('span', { 'class': 'mwan4-meta-item' }, [
-					E('span', { 'class': 'mwan4-meta-key' }, _('Kernel Default Route:')),
-					E('span', { 'class': 'mwan4-badge' }, [
-						dot(ri.level, 'route-dot'),
-						E('span', { 'data-role': 'route-text' }, ri.text)
-					])
-				]),
-				E('span', { 'class': 'mwan4-meta-item' }, [
-					E('span', { 'class': 'mwan4-meta-key' }, _('Status File:')),
-					E('span', { 'class': 'mwan4-badge' }, [
-						E('span', { 'data-role': 'age-text' }, statusAgeText(statusData))
-					])
-				]),
-				E('span', {
-					'class': 'mwan4-meta-item',
-					'data-role': 'policy-item',
-					'style': policyText(statusData) ? '' : 'display: none'
-				}, [
-					E('span', { 'class': 'mwan4-meta-key' }, _('Policy Routing:')),
-					E('span', { 'class': 'mwan4-badge' }, [
-						E('span', { 'data-role': 'policy-text' }, policyText(statusData) || '')
-					])
-				]),
-				E('span', { 'class': 'mwan4-meta-item' }, [
-					E('span', { 'class': 'mwan4-meta-key' }, _('Hash Granularity:')),
-					E('span', { 'class': 'mwan4-badge' }, [
-						dot(hashInfo(statusData).level, 'hash-dot'),
-						E('span', { 'data-role': 'hash-text' }, hashInfo(statusData).text)
-					])
+				E('div', { 'class': 'mwan4-tile' }, [
+					E('span', { 'class': 'mwan4-tile-key' }, _('Aggregate')),
+					E('span', { 'class': 'mwan4-tile-val mwan4-mono', 'data-role': 'agg-text' },
+						'\u2191 ' + formatRate(ws.tx) + '  \u2193 ' + formatRate(ws.rx))
 				])
 			])
 		]);
@@ -315,23 +427,20 @@ return view.extend({
 	renderCard: function(iface, fresh) {
 		var up = iface.state === 'UP';
 		var loss = iface.loss_rate || 0;
-		// 首帧就要用真正的新鲜度，否则载入一个陈旧快照时第一眼会是「即时状态」
 		var trust = fresh || 'fresh';
 		var alert = cardAlert(iface, trust);
-		var stale = (trust === 'stale' || trust === 'skew' || trust === 'missing');
 
 		return E('div', {
-			'class': 'mwan4-card' + (stale ? ' mwan4-card-stale' : '') +
-				(iface.local_condition ? ' mwan4-card-local' : ''),
+			'class': cardClass(iface, trust),
 			'data-iface': iface.name
 		}, [
 			E('div', { 'class': 'mwan4-card-head' }, [
 				E('div', { 'class': 'mwan4-card-id' }, [
 					E('span', { 'class': 'mwan4-card-title' }, iface.name),
-					E('span', { 'class': 'mwan4-card-ip' }, iface.ip ? '(' + iface.ip + ')' : _('(No IP)'))
+					E('span', { 'class': 'mwan4-card-ip' }, iface.ip ? iface.ip : _('(No IP)'))
 				]),
-				E('span', { 'class': 'mwan4-badge' }, [
-					dot(up ? 'ok' : 'bad', 'state-dot'),
+				E('span', { 'class': 'mwan4-badge mwan4-badge-state' }, [
+					dot(up ? (iface.degraded ? 'warn' : 'ok') : 'bad', 'state-dot'),
 					E('span', { 'data-role': 'state-text' }, stateText(iface))
 				])
 			]),
@@ -366,12 +475,16 @@ return view.extend({
 						E('span', { 'data-role': 'pw' }, pwText(iface))
 					])
 				]),
-				E('div', { 'class': 'mwan4-stat-item' }, [
+				E('div', { 'class': 'mwan4-stat-item mwan4-stat-wide' }, [
 					E('span', { 'class': 'mwan4-stat-label' }, _('Throughput (TX / RX)')),
 					E('span', { 'class': 'mwan4-stat-val mwan4-mono' }, [
 						E('span', { 'data-role': 'rate' }, rateText(iface))
 					])
 				])
+			]),
+			E('div', { 'class': 'mwan4-trend-wrap' }, [
+				E('span', { 'class': 'mwan4-trend-label' }, _('RTT Trend')),
+				trendEl(iface)
 			]),
 			E('div', { 'class': 'mwan4-loss-section' }, [
 				E('div', { 'class': 'mwan4-loss-header' }, [
@@ -390,8 +503,8 @@ return view.extend({
 				])
 			]),
 			E('div', { 'class': 'mwan4-card-footer' }, [
-				E('span', { 'data-role': 'succ' }, succText(iface)),
-				E('span', { 'data-role': 'to' }, toText(iface))
+				E('span', { 'class': 'mwan4-chip', 'data-role': 'succ' }, succText(iface)),
+				E('span', { 'class': 'mwan4-chip', 'data-role': 'to' }, toText(iface))
 			])
 		]);
 	},
@@ -422,12 +535,10 @@ return view.extend({
 		var up = iface.state === 'UP';
 		var loss = iface.loss_rate || 0;
 		var lLevel = lossLevel(loss);
-		var stale = (fresh === 'stale' || fresh === 'skew');
 
 		setText(pick(card, 'state-text'), stateText(iface));
-		setCls(pick(card, 'state-dot'), 'mwan4-dot ' + (up ? 'ok' : 'bad'));
+		setCls(pick(card, 'state-dot'), 'mwan4-dot ' + (up ? (iface.degraded ? 'warn' : 'ok') : 'bad'));
 
-		// 过期／本机条件错误一律标在卡片上：不要让「最后一次快照」伪装成即时状态
 		var alert = cardAlert(iface, fresh);
 		var alertEl = pick(card, 'alert');
 		if (alertEl) {
@@ -435,14 +546,16 @@ return view.extend({
 			var display = alert ? '' : 'none';
 			if (alertEl.style.display !== display) alertEl.style.display = display;
 		}
-		setCls(card, 'mwan4-card' + (stale ? ' mwan4-card-stale' : '') +
-			(iface.local_condition ? ' mwan4-card-local' : ''));
+		setCls(card, cardClass(iface, fresh));
 
 		setText(pick(card, 'rtt'), rttText(iface));
 		setCls(pick(card, 'rtt-dot'), 'mwan4-dot ' + (up ? rttLevel(iface.rtt_ms) : 'muted'));
 		setText(pick(card, 'jitter'), jitterText(iface));
 		setText(pick(card, 'gw'), iface.gateway);
 		setText(pick(card, 'pw'), pwText(iface));
+
+		var trend = pick(card, 'trend');
+		if (trend) updateTrend(trend, iface);
 
 		setText(pick(card, 'loss'), lossText(iface));
 		setCls(pick(card, 'loss-dot'), 'mwan4-dot ' + lLevel);
@@ -455,12 +568,18 @@ return view.extend({
 	},
 
 	applyStatus: function(statusData) {
+		this.recordTrend(statusData);
 		var fresh = freshnessOf(statusData);
+		var ws = wanSummary(statusData);
 		var header = document.getElementById('mwan4_header_container');
 		if (header) {
 			var ri = routeInfo(statusData);
 			setText(pick(header, 'run-text'), runText(fresh));
 			setCls(pick(header, 'run-dot'), 'mwan4-dot ' + runLevel(fresh));
+			setText(pick(header, 'wan-text'), ws.text);
+			setCls(pick(header, 'wan-dot'), 'mwan4-dot ' + ws.level);
+			setText(pick(header, 'agg-text'),
+				'\u2191 ' + formatRate(ws.tx) + '  \u2193 ' + formatRate(ws.rx));
 			setText(pick(header, 'route-text'), ri.text);
 			setCls(pick(header, 'route-dot'), 'mwan4-dot ' + ri.level);
 			setText(pick(header, 'age-text'), statusAgeText(statusData));
@@ -479,7 +598,7 @@ return view.extend({
 		var list = (statusData && statusData.interfaces) ? statusData.interfaces : [];
 		var sig = list.map(function(iface) { return iface.name; }).join(',');
 
-		// Only rebuild when the interface set itself changed; otherwise patch values in place.
+		// 介面集合没变就只更新数值，避免轮询时整页闪动
 		if (container.getAttribute('data-sig') !== sig) {
 			container.parentNode.replaceChild(this.cardsContainer(statusData), container);
 			return;
@@ -492,12 +611,8 @@ return view.extend({
 	},
 
 	updateDashboard: function() {
-		// LuCI views have no teardown hook, so let the poll detach itself: once this
-		// view is no longer in the document it is dropped from the poll queue.
-		// Allow a couple of ticks of grace for the async render to finish inserting
-		// the view root (poll.add() runs before the form promise resolves); without
-		// it, leaving the page within that window would leak both the poll entry
-		// and the whole detached DOM forever.
+		// LuCI 的 view 没有卸载回调，让轮询自己退出：view 不在 document 里就不再入列。
+		// 给两次宽限，因为 poll.add() 跑在 form promise 解析之前。
 		if (this.viewRoot && this.viewRoot.isConnected) {
 			this.pollMisses = 0;
 		} else if (++this.pollMisses >= 3) {
@@ -520,24 +635,29 @@ return view.extend({
 
 		var styleNode = E('style', {}, `
 			.mwan4-view {
-				--mw-fg: #333333;
+				--mw-fg: #2f3337;
 				--mw-muted: #8a8f98;
-				--mw-line: rgba(0, 0, 0, 0.10);
-				--mw-surface: rgba(0, 0, 0, 0.015);
-				--mw-track: rgba(0, 0, 0, 0.07);
+				--mw-line: rgba(0, 0, 0, 0.11);
+				--mw-line-strong: rgba(0, 0, 0, 0.20);
+				--mw-surface: rgba(0, 0, 0, 0.018);
+				--mw-surface-2: rgba(0, 0, 0, 0.04);
+				--mw-track: rgba(0, 0, 0, 0.08);
 				--mw-ok: #35a06a;
 				--mw-warn: #c9821f;
 				--mw-bad: #cf4436;
 				--mw-info: #5b7fb9;
+				--mw-radius: 8px;
 			}
 
 			@media (prefers-color-scheme: dark) {
 				.mwan4-view {
-					--mw-fg: #d4d4d4;
+					--mw-fg: #d6d6d6;
 					--mw-muted: #8b8f96;
-					--mw-line: rgba(255, 255, 255, 0.12);
-					--mw-surface: rgba(255, 255, 255, 0.025);
-					--mw-track: rgba(255, 255, 255, 0.10);
+					--mw-line: rgba(255, 255, 255, 0.13);
+					--mw-line-strong: rgba(255, 255, 255, 0.24);
+					--mw-surface: rgba(255, 255, 255, 0.03);
+					--mw-surface-2: rgba(255, 255, 255, 0.06);
+					--mw-track: rgba(255, 255, 255, 0.12);
 					--mw-ok: #4cb87c;
 					--mw-warn: #d69a3a;
 					--mw-bad: #e0685a;
@@ -549,18 +669,19 @@ return view.extend({
 			html[data-theme="dark"] .mwan4-view,
 			body.dark .mwan4-view,
 			.dark .mwan4-view {
-				--mw-fg: #d4d4d4 !important;
+				--mw-fg: #d6d6d6 !important;
 				--mw-muted: #8b8f96 !important;
-				--mw-line: rgba(255, 255, 255, 0.12) !important;
-				--mw-surface: rgba(255, 255, 255, 0.025) !important;
-				--mw-track: rgba(255, 255, 255, 0.10) !important;
+				--mw-line: rgba(255, 255, 255, 0.13) !important;
+				--mw-line-strong: rgba(255, 255, 255, 0.24) !important;
+				--mw-surface: rgba(255, 255, 255, 0.03) !important;
+				--mw-surface-2: rgba(255, 255, 255, 0.06) !important;
+				--mw-track: rgba(255, 255, 255, 0.12) !important;
 				--mw-ok: #4cb87c !important;
 				--mw-warn: #d69a3a !important;
 				--mw-bad: #e0685a !important;
 				--mw-info: #7d9fd0 !important;
 			}
 
-			/* ---- dot ---- */
 			.mwan4-dot {
 				display: inline-block;
 				width: 7px;
@@ -575,7 +696,6 @@ return view.extend({
 			.mwan4-dot.info  { background: var(--mw-info); }
 			.mwan4-dot.muted { background: var(--mw-muted); opacity: .55; }
 
-			/* ---- badge ---- */
 			.mwan4-badge {
 				display: inline-flex;
 				align-items: center;
@@ -587,57 +707,114 @@ return view.extend({
 				line-height: 1.4;
 			}
 
-			/* ---- header ---- */
+			/* ---- 页首 ---- */
 			.mwan4-header {
 				display: flex;
 				justify-content: space-between;
 				align-items: center;
 				flex-wrap: wrap;
 				gap: 12px 24px;
-				padding: 0 0 14px 0;
-				margin-bottom: 18px;
-				border-bottom: 1px solid var(--mw-line);
+				padding: 14px 16px;
+				margin-bottom: 12px;
+				background: var(--mw-surface);
+				border: 1px solid var(--mw-line);
+				border-radius: var(--mw-radius);
+			}
+			.mwan4-brand {
+				display: flex;
+				flex-direction: column;
+				gap: 2px;
+				min-width: 0;
 			}
 			.mwan4-title {
-				margin: 0;
-				font-size: 15px;
-				font-weight: 600;
+				font-size: 16px;
+				font-weight: 650;
+				letter-spacing: .2px;
 				color: var(--mw-fg);
+			}
+			.mwan4-sub {
+				font-size: 11.5px;
+				color: var(--mw-muted);
 			}
 			.mwan4-meta {
 				display: flex;
 				align-items: center;
 				flex-wrap: wrap;
-				gap: 8px 22px;
+				gap: 8px;
 			}
 			.mwan4-meta-item {
 				display: inline-flex;
 				align-items: center;
 				gap: 7px;
-				font-size: 12.5px;
+				padding: 4px 10px;
+				font-size: 12px;
+				background: var(--mw-surface-2);
+				border: 1px solid var(--mw-line);
+				border-radius: 999px;
 			}
 			.mwan4-meta-key {
 				color: var(--mw-muted);
 			}
 
-			/* ---- cards ---- */
+			/* ---- 概况砖 ---- */
+			.mwan4-summary {
+				display: flex;
+				flex-wrap: wrap;
+				gap: 10px;
+				margin-bottom: 16px;
+			}
+			.mwan4-tile {
+				flex: 1 1 170px;
+				display: flex;
+				flex-direction: column;
+				gap: 3px;
+				padding: 10px 14px;
+				background: var(--mw-surface);
+				border: 1px solid var(--mw-line);
+				border-radius: var(--mw-radius);
+			}
+			.mwan4-tile-key {
+				font-size: 11.5px;
+				color: var(--mw-muted);
+			}
+			.mwan4-tile-val {
+				display: inline-flex;
+				align-items: center;
+				gap: 8px;
+				font-size: 17px;
+				font-weight: 650;
+				color: var(--mw-fg);
+				font-variant-numeric: tabular-nums;
+			}
+
+			/* ---- 卡片 ---- */
 			.mwan4-cards-grid {
 				display: grid;
-				grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+				grid-template-columns: repeat(auto-fit, minmax(330px, 1fr));
 				gap: 14px;
 				margin-bottom: 24px;
 			}
-
 			.mwan4-card {
 				margin: 0 !important;
-				padding: 16px !important;
+				padding: 16px 18px !important;
 				background: var(--mw-surface) !important;
 				border: 1px solid var(--mw-line) !important;
-				border-radius: 6px !important;
+				border-left: 3px solid var(--mw-ok) !important;
+				border-radius: var(--mw-radius) !important;
 				box-shadow: none !important;
 				color: var(--mw-fg) !important;
+				transition: box-shadow .15s ease, border-color .15s ease;
 			}
-
+			.mwan4-card:hover {
+				box-shadow: 0 4px 16px rgba(0, 0, 0, 0.09) !important;
+			}
+			.mwan4-card-down     { border-left-color: var(--mw-bad) !important; }
+			.mwan4-card-degraded { border-left-color: var(--mw-warn) !important; }
+			.mwan4-card-local    { border-left-color: var(--mw-warn) !important; }
+			.mwan4-card-stale {
+				border-style: dashed !important;
+				opacity: .78;
+			}
 			.mwan4-card-head {
 				display: flex;
 				justify-content: space-between;
@@ -648,37 +825,36 @@ return view.extend({
 				border-bottom: 1px solid var(--mw-line);
 			}
 			.mwan4-card-id {
+				display: flex;
+				align-items: baseline;
+				gap: 8px;
 				min-width: 0;
 				overflow: hidden;
-				text-overflow: ellipsis;
 				white-space: nowrap;
 			}
 			.mwan4-card-title {
 				font-size: 15px;
-				font-weight: 600;
+				font-weight: 650;
 				color: var(--mw-fg);
-				margin-right: 8px;
 			}
 			.mwan4-card-ip {
 				color: var(--mw-muted);
-				font-size: 12.5px;
+				font-size: 12px;
 				font-family: monospace;
+				overflow: hidden;
+				text-overflow: ellipsis;
 			}
-
-			/* 资料过期：虚线 + 淡化，避免「最后一次快照」被当成即时状态 */
-			.mwan4-card-stale {
-				border-style: dashed !important;
-				opacity: .75;
-			}
-			.mwan4-card-local {
-				border-color: var(--mw-warn) !important;
+			.mwan4-badge-state {
+				padding: 3px 9px;
+				border-radius: 999px;
+				background: var(--mw-surface-2);
+				font-size: 11.5px;
 			}
 			.mwan4-card-alert {
-				display: block;
 				margin: 0 0 10px 0;
-				padding: 6px 8px;
+				padding: 6px 9px;
 				border-radius: 4px;
-				background: var(--mw-surface);
+				background: var(--mw-surface-2);
 				border-left: 3px solid var(--mw-warn);
 				color: var(--mw-muted);
 				font-size: 11.5px;
@@ -691,14 +867,17 @@ return view.extend({
 
 			.mwan4-stats-grid {
 				display: grid;
-				grid-template-columns: 1fr 1fr;
-				gap: 12px;
-				margin-bottom: 12px;
+				grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
+				gap: 12px 14px;
+				margin-bottom: 10px;
 			}
 			.mwan4-stat-item {
 				display: flex;
 				flex-direction: column;
 				min-width: 0;
+			}
+			.mwan4-stat-wide {
+				grid-column: 1 / -1;
 			}
 			.mwan4-stat-label {
 				color: var(--mw-muted);
@@ -712,14 +891,53 @@ return view.extend({
 				font-size: 15px;
 				font-weight: 600;
 				color: var(--mw-fg);
+				font-variant-numeric: tabular-nums;
+				min-width: 0;
+				overflow: hidden;
+				text-overflow: ellipsis;
+				white-space: nowrap;
 			}
 			.mwan4-mono {
 				font-family: monospace;
-				font-size: 13.5px;
+				font-size: 13px;
 				font-weight: 500;
 			}
+			.mwan4-tile-val.mwan4-mono {
+				font-size: 15px;
+			}
 
-			/* ---- loss meter ---- */
+			/* ---- RTT 趋势 ---- */
+			.mwan4-trend-wrap {
+				margin: 10px 0 2px 0;
+			}
+			.mwan4-trend-label {
+				display: block;
+				font-size: 11.5px;
+				color: var(--mw-muted);
+				margin-bottom: 4px;
+			}
+			.mwan4-trend {
+				display: flex;
+				align-items: flex-end;
+				gap: 1px;
+				height: 34px;
+				border-bottom: 1px solid var(--mw-line);
+			}
+			.mwan4-trend-bar {
+				flex: 1 1 0;
+				min-width: 0;
+				height: 0;
+				border-radius: 1px 1px 0 0;
+				background: var(--mw-muted);
+				opacity: .35;
+				transition: height .35s ease;
+			}
+			.mwan4-trend-bar.ok   { background: var(--mw-ok); opacity: .8; }
+			.mwan4-trend-bar.warn { background: var(--mw-warn); opacity: .9; }
+			.mwan4-trend-bar.bad  { background: var(--mw-bad); opacity: .9; }
+			.mwan4-trend-bar.empty { background: var(--mw-line-strong); opacity: .25; }
+
+			/* ---- 丢包条 ---- */
 			.mwan4-loss-section {
 				margin-top: 12px;
 			}
@@ -733,15 +951,15 @@ return view.extend({
 			}
 			.mwan4-meter {
 				width: 100%;
-				height: 3px;
+				height: 5px;
 				background: var(--mw-track);
-				border-radius: 2px;
+				border-radius: 3px;
 				overflow: hidden;
 			}
 			.mwan4-meter-fill {
 				display: block;
 				height: 100%;
-				border-radius: 2px;
+				border-radius: 3px;
 				background: var(--mw-muted);
 				transition: width .3s ease;
 			}
@@ -753,26 +971,31 @@ return view.extend({
 				margin-top: 12px;
 				padding-top: 10px;
 				border-top: 1px solid var(--mw-line);
-				font-size: 11.5px;
-				color: var(--mw-muted);
 				display: flex;
-				justify-content: space-between;
-				gap: 10px;
+				flex-wrap: wrap;
+				gap: 8px;
+			}
+			.mwan4-chip {
+				padding: 2px 8px;
+				border-radius: 999px;
+				background: var(--mw-surface-2);
+				border: 1px solid var(--mw-line);
+				font-size: 11px;
+				color: var(--mw-muted);
+				font-variant-numeric: tabular-nums;
 			}
 
-			/* ---- empty state ---- */
 			.mwan4-empty {
 				grid-column: 1 / -1;
 				padding: 18px 16px;
 				border: 1px dashed var(--mw-line);
-				border-radius: 6px;
-				background: transparent;
+				border-radius: var(--mw-radius);
 				color: var(--mw-muted);
 				font-size: 13px;
 				text-align: center;
 			}
 
-			/* ---- WAN Interfaces grid: tighter rows, no sideways overflow ---- */
+			/* ---- WAN Interfaces 表格 ---- */
 			.mwan4-view table.cbi-section-table {
 				table-layout: fixed;
 				width: 100%;
@@ -784,7 +1007,7 @@ return view.extend({
 				line-height: 1.35 !important;
 				vertical-align: middle !important;
 			}
-			/* 8 columns: Name | Enable | Interface | Gateway | Metric | Weight | Targets | actions */
+			/* 8 列：Name | Enable | Interface | Gateway | Metric | Weight | Targets | actions */
 			.mwan4-view table.cbi-section-table th:nth-child(1) { width: 12%; }
 			.mwan4-view table.cbi-section-table th:nth-child(2) { width: 6%; }
 			.mwan4-view table.cbi-section-table th:nth-child(3) { width: 13%; }
@@ -792,20 +1015,18 @@ return view.extend({
 			.mwan4-view table.cbi-section-table th:nth-child(5) { width: 9%; }
 			.mwan4-view table.cbi-section-table th:nth-child(6) { width: 9%; }
 			.mwan4-view table.cbi-section-table th:nth-child(7) { width: 25%; }
-			/* description row: LuCI renders it one cell short, alignDescrRows() pads it */
 			.mwan4-view table.cbi-section-table tr.cbi-section-table-descr th {
 				font-size: 11px !important;
 				font-weight: 400 !important;
 				color: var(--mw-muted) !important;
 				padding-top: 0 !important;
 				text-align: left;
-				/* the theme sets nowrap on th, which makes long hints overlap */
 				white-space: normal !important;
 				overflow: hidden !important;
 				word-break: break-word;
 			}
-			/* the page is static except the probe numbers, so let text stay selectable */
 			.mwan4-view .mwan4-header,
+			.mwan4-view .mwan4-summary,
 			.mwan4-view .mwan4-cards-grid,
 			.mwan4-view table.cbi-section-table {
 				-webkit-user-select: text;
@@ -837,7 +1058,6 @@ return view.extend({
 				padding: 2px 8px !important;
 				font-size: 12px !important;
 			}
-			/* ---- Interface Name field: keep the box short (table cell + add form) ---- */
 			.mwan4-view input[id$="-name"],
 			.mwan4-view select[id$="-name"] {
 				max-width: 180px !important;
@@ -851,58 +1071,20 @@ return view.extend({
 				.mwan4-cards-grid { grid-template-columns: 1fr; }
 			}
 
-			/* ---- scrollbar: system default, not the themed purple pill ---- */
-			:root {
-				--mw-sb-track: #f1f1f1;
-				--mw-sb-thumb: #c1c1c1;
-				--mw-sb-thumb-hover: #a8a8a8;
+			/* 滚动条跟随主题，且只作用在本页 */
+			.mwan4-view * {
+				scrollbar-width: thin;
+				scrollbar-color: var(--mw-line-strong) transparent;
 			}
-
-			@media (prefers-color-scheme: dark) {
-				:root {
-					--mw-sb-track: #262626;
-					--mw-sb-thumb: #5a5a5a;
-					--mw-sb-thumb-hover: #6e6e6e;
-				}
-			}
-
-			html[data-darkmode="true"],
-			html[data-theme="dark"] {
-				--mw-sb-track: #262626 !important;
-				--mw-sb-thumb: #5a5a5a !important;
-				--mw-sb-thumb-hover: #6e6e6e !important;
-			}
-
-			html, body, .mwan4-view, .mwan4-view * {
-				scrollbar-width: auto !important;
-				scrollbar-color: var(--mw-sb-thumb) var(--mw-sb-track) !important;
-			}
-
-			::-webkit-scrollbar {
-				width: 15px !important;
-				height: 15px !important;
-				background: var(--mw-sb-track) !important;
-			}
-			::-webkit-scrollbar-track,
-			::-webkit-scrollbar-corner {
-				background: var(--mw-sb-track) !important;
-				border: 0 !important;
-				border-radius: 0 !important;
-				box-shadow: none !important;
-			}
-			::-webkit-scrollbar-thumb {
-				background: var(--mw-sb-thumb) !important;
-				border: 3px solid var(--mw-sb-track) !important;
-				border-radius: 0 !important;
-				box-shadow: none !important;
-			}
-			::-webkit-scrollbar-thumb:hover {
-				background: var(--mw-sb-thumb-hover) !important;
-			}
-			::-webkit-scrollbar-button {
-				display: none !important;
+			.mwan4-view ::-webkit-scrollbar { width: 10px; height: 10px; }
+			.mwan4-view ::-webkit-scrollbar-track { background: transparent; }
+			.mwan4-view ::-webkit-scrollbar-thumb {
+				background: var(--mw-line-strong);
+				border-radius: 5px;
 			}
 		`);
+
+		this.recordTrend(statusData);
 
 		var viewRoot = E('div', { 'class': 'mwan4-view' }, [
 			styleNode,
@@ -910,19 +1092,15 @@ return view.extend({
 			this.cardsContainer(statusData)
 		]);
 
-		// poll.remove() compares function references, so keep the bound handler.
 		this.viewRoot = viewRoot;
 		this.pollMisses = 0;
 		this.pollFn = this.updateDashboard.bind(this);
-		// 与 LuCI 全域预设一致的 5 秒轮询：守护进程每秒写一次状态档，
-		// 2 秒一拉的频率对低配路由器上的 uhttpd/rpcd 是纯粹的常驻开销
+		// 与 LuCI 全域预设一致的 5 秒轮询（daemon 每秒写一次状态档）
 		poll.add(this.pollFn, 5);
 
+		m = new form.Map('mwan4', _('MWAN4 Configuration'),
+			_('Multi-WAN interfaces and health probes via UCI. Save & Apply reloads the daemon.'));
 
-		// Configuration form
-		m = new form.Map('mwan4', _('MWAN4 Configuration'));
-
-		// Global settings (tabbed: basic / advanced)
 		s = m.section(form.NamedSection, 'global', 'global', _('Global Settings'));
 		s.tab('basic', _('Basic'));
 		s.tab('advanced', _('Advanced'));
@@ -931,32 +1109,38 @@ return view.extend({
 		o.default = o.enabled;
 		o.rmempty = false;
 
-		o = s.taboption('basic', form.Value, 'check_interval_ms', _('Probe Interval (ms)'));
+		o = s.taboption('basic', form.Value, 'check_interval_ms', _('Probe Interval (ms)'),
+			_('Probe interval per interface (default: 500 ms)'));
 		o.datatype = 'uinteger';
 		o.default = '500';
 		o.rmempty = false;
 
-		o = s.taboption('basic', form.Value, 'probe_timeout_ms', _('Probe Timeout (ms)'));
+		o = s.taboption('basic', form.Value, 'probe_timeout_ms', _('Probe Timeout (ms)'),
+			_('Unanswered probe is considered lost after this duration (default: 400ms, must not exceed the probe interval)'));
 		o.datatype = 'uinteger';
 		o.default = '400';
 		o.rmempty = false;
 
-		o = s.taboption('basic', form.Value, 'window_size', _('Sliding Window Size'));
+		o = s.taboption('basic', form.Value, 'window_size', _('Sliding Window Size'),
+			_('Number of probe samples to calculate loss rate and smoothed RTT (default: 10)'));
 		o.datatype = 'uinteger';
 		o.default = '10';
 		o.rmempty = false;
 
-		o = s.taboption('basic', form.Value, 'consecutive_fail_down', _('Consecutive Failures for DOWN'));
+		o = s.taboption('basic', form.Value, 'consecutive_fail_down', _('Consecutive Failures for DOWN'),
+			_('Consecutive probe timeouts before interface is marked DOWN (default: 3)'));
 		o.datatype = 'uinteger';
 		o.default = '3';
 		o.rmempty = false;
 
-		o = s.taboption('basic', form.Value, 'recovery_success_count', _('Recovery Success Count (Hysteresis)'));
+		o = s.taboption('basic', form.Value, 'recovery_success_count', _('Recovery Success Count (Hysteresis)'),
+			_('Consecutive successful probes with <10% loss required before recovering to UP (default: 5)'));
 		o.datatype = 'uinteger';
 		o.default = '5';
 		o.rmempty = false;
 
-		o = s.taboption('basic', form.ListValue, 'ecmp_mode', _('Multi-WAN Routing Mode'));
+		o = s.taboption('basic', form.ListValue, 'ecmp_mode', _('Multi-WAN Routing Mode'),
+			_('standard keeps a single multipath route, so link changes rehash and may drop existing connections. resilient remaps only the failed links (Linux 5.14+).'));
 		o.value('standard', _('Standard ECMP (multipath route)'));
 		o.value('auto', _('Automatic (resilient when supported)'));
 		o.value('resilient', _('Resilient nexthop group (require kernel support)'));
@@ -973,50 +1157,39 @@ return view.extend({
 		o.default = 'static';
 		o.rmempty = false;
 
-		o = s.taboption('advanced', form.Value, 'dynamic_weight_interval_ms', _('Dynamic Weight Update Interval (ms)'));
+		o = s.taboption('advanced', form.Value, 'dynamic_weight_interval_ms',
+			_('Dynamic Weight Update Interval (ms)'),
+			_('Minimum interval between dynamic weight updates (default: 10000 ms). Each update re-installs the ECMP route.'));
 		o.datatype = 'uinteger';
 		o.default = '10000';
-		o.depends('weight_mode', 'quality');
-		o.depends('load_aware', '1');
-
-		o = s.taboption('advanced', form.Value, 'dynamic_weight_min_ratio', _('Dynamic Weight Floor (ratio)'));
-		o.datatype = 'ufloat';
-		o.default = '0.25';
 		o.depends('weight_mode', 'quality');
 		o.depends('load_aware', '1');
 
 		o = s.taboption('advanced', form.Flag, 'load_aware', _('Load-aware Traffic Shifting'));
 		o.default = o.disabled;
 
-		o = s.taboption('advanced', form.Value, 'load_target_ratio', _('Load Offload Threshold (ratio)'));
-		o.datatype = 'ufloat';
-		o.default = '0.80';
-		o.depends('load_aware', '1');
-
-		o = s.taboption('advanced', form.Value, 'load_recover_ratio', _('Load Recover Threshold (ratio)'));
-		o.datatype = 'ufloat';
-		o.default = '0.60';
-		o.depends('load_aware', '1');
-
-		o = s.taboption('advanced', form.ListValue, 'multipath_hash_policy', _('Multipath Hash Policy'));
-		o.value('l3', _('L3 (addresses only)'));
+		o = s.taboption('advanced', form.ListValue, 'multipath_hash_policy', _('Multipath Hash Policy'),
+			_('Kernel fib_multipath_hash_policy. l4 (default on most systems) also hashes ports and spreads flows most evenly; l3 hashes addresses only; inner also uses tunnel inner headers. Applied at daemon start.'));
 		o.value('l4', _('L4 (addresses + ports, the default)'));
+		o.value('l3', _('L3 (addresses only)'));
 		o.value('inner', _('L3 + tunnel inner headers'));
-		o.value('', _('Leave the kernel default (L3: one WAN per destination IP)'));
 		o.default = 'l4';
-		o.rmempty = true;
+		o.rmempty = false;
 
-		o = s.taboption('advanced', form.Flag, 'flush_conntrack', _('Flush Conntrack on DOWN'));
+		o = s.taboption('advanced', form.Flag, 'allow_dynamic_weights_on_standard',
+			_('Allow Dynamic Weights on Standard ECMP'));
+		o.default = o.disabled;
+		o.depends('ecmp_mode', 'standard');
+
+		o = s.taboption('advanced', form.Flag, 'flush_conntrack', _('Flush Conntrack on DOWN'),
+			_('Flush TCP/UDP connections on an interface when it goes down.'));
 		o.default = o.enabled;
 
 		o = s.taboption('advanced', form.Flag, 'flush_conntrack_on_switch', _('Flush Conntrack on Active Set Change'));
 		o.default = o.enabled;
 
-		o = s.taboption('advanced', form.Flag, 'remove_routes_on_exit', _('Remove Default Route on Exit'));
-		o.default = o.disabled;
-
-		// WAN interface list
-		s = m.section(form.GridSection, 'interface', _('WAN Interfaces'));
+		s = m.section(form.GridSection, 'interface', _('WAN Interfaces'),
+			_('Gateway, ECMP weight and probe targets for each WAN interface.'));
 		s.addremove = true;
 		s.anonymous = false;
 
@@ -1032,11 +1205,9 @@ return view.extend({
 				o.value(dev);
 			});
 		} else {
-			var netSections = uci.sections('network', 'interface');
-			netSections.forEach(function(sec) {
-				if (sec['.name'] && sec['.name'] !== 'loopback' && sec['.name'] !== 'lan') {
+			uci.sections('network', 'interface').forEach(function(sec) {
+				if (sec['.name'] && sec['.name'] !== 'loopback' && sec['.name'] !== 'lan')
 					o.value(sec['.name']);
-				}
 			});
 		}
 
@@ -1045,17 +1216,20 @@ return view.extend({
 		o.rmempty = false;
 		o.editable = true;
 
-		o = s.option(form.Value, 'metric', _('Metric (Priority)'));
+		o = s.option(form.Value, 'metric', _('Metric (Priority)'),
+			_('Lower = higher priority. Same metric = ECMP load balancing, different metrics = primary/backup failover.'));
 		o.datatype = 'uinteger';
 		o.default = '10';
 		o.editable = true;
 
-		o = s.option(form.Value, 'weight', _('ECMP Weight'));
+		o = s.option(form.Value, 'weight', _('ECMP Weight'),
+			_('ECMP weight for interfaces with the same metric.'));
 		o.datatype = 'uinteger';
 		o.default = '1';
 		o.editable = true;
 
-		o = s.option(form.Value, 'max_mbps', _('Max Bandwidth (Mbps)'));
+		o = s.option(form.Value, 'max_mbps', _('Max Bandwidth (Mbps)'),
+			_('Line capacity. When set on every interface, the ECMP weights become proportional to it (weight x max_mbps); it is also the LAN download capacity used by load-aware shifting. Required on every interface when Load-aware Traffic Shifting is enabled.'));
 		o.datatype = 'ufloat';
 		o.editable = true;
 
@@ -1067,7 +1241,6 @@ return view.extend({
 		o.datatype = 'ipaddrport(1)';
 		o.default = ['223.5.5.5:53', '114.114.114.114:53'];
 
-		// Policy routing (source / destination)
 		s = m.section(form.GridSection, 'policy', _('Policy Routing (Source / Destination)'));
 		s.addremove = true;
 		s.anonymous = false;
@@ -1077,7 +1250,8 @@ return view.extend({
 		o.rmempty = false;
 		o.editable = true;
 
-		o = s.option(form.DynamicList, 'source', _('Source Prefixes (CIDR)'));
+		o = s.option(form.DynamicList, 'source', _('Source Prefixes (CIDR)'),
+			_('IPv4 source prefixes, e.g. 192.168.3.0/24. Leave empty to match any source.'));
 		o.datatype = 'cidr4';
 		o.editable = true;
 

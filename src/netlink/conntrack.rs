@@ -1,12 +1,10 @@
-// 本模组只在 Linux 上真正执行 netlink I/O；
-// 在非 Linux 平台上（例如在 Windows 上 `cargo check`）会整批变成 dead code。
+// 非 Linux 平台上（例如在 Windows 上 `cargo check`）整批变成 dead code。
 #![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
 
 use log::{debug, info, warn};
 use std::io;
 use std::net::Ipv4Addr;
 
-// 部分工具函数仅在 Linux 分支中使用
 #[allow(unused_imports)]
 use crate::netlink::util::{
     NlMsgHdr, nlmsg_align, read_i32, read_u16, rta_align, set_socket_timeouts, write_u16,
@@ -28,7 +26,6 @@ pub const NLM_F_REQUEST: u16 = 0x01;
 #[allow(dead_code)]
 pub const NLM_F_DUMP: u16 = 0x300; // NLM_F_ROOT | NLM_F_MATCH
 
-// CtNetlink 属性定义
 #[allow(dead_code)]
 pub const CTA_UNSPEC: u16 = 0;
 #[allow(dead_code)]
@@ -43,12 +40,10 @@ pub const CTA_IP_V4_SRC: u16 = 1;
 pub const CTA_IP_V4_DST: u16 = 2;
 #[allow(dead_code)]
 pub const NLA_TYPE_MASK: u16 = 0x3fff;
-/// conntrack zone（u16）。带 zone 的部署（nftables `ct zone`）若删除时不回填，
-/// 内核会在 zone 0 找同 tuple 的连线：轻则 ENOENT 漏删，重则误删 zone 0 的条目。
+/// conntrack zone（u16）：带 zone 的部署删除时不回填，内核会在 zone 0 找同 tuple 的连线，漏删甚至误删。
 #[allow(dead_code)]
 pub const CTA_ZONE: u16 = 18;
 
-/// struct nfgenmsg（4 bytes）
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct NfGenMsg {
@@ -69,15 +64,11 @@ impl NfGenMsg {
     }
 }
 
-/// dump 单次 recv 的缓冲区大小
 const DUMP_BUF_SIZE: usize = 32 * 1024;
-/// 批量删除时单次 send 的累积上限
 const DELETE_BATCH_LIMIT: usize = 8 * 1024;
-/// conntrack socket 的收/发逾时
 const CT_RECV_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const CT_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Conntrack 管理器
 pub struct ConntrackManager {
     #[cfg(target_os = "linux")]
     sock_fd: libc::c_int,
@@ -135,11 +126,7 @@ impl ConntrackManager {
         Ok(sock_fd)
     }
 
-    /// 关掉旧 socket 并重开。
-    ///
-    /// netlink 的 dump 状态是「socket 级」的：上一次 dump 没收到 `NLMSG_DONE` 就结束时，
-    /// 核心会认为 dump 仍在进行中，之后同一 socket 上的 `NLM_F_DUMP` 一律回 `-EBUSY`
-    /// —— flush 就变成永远扫不到东西的 no-op。逾时／错误后直接重建 socket 最干净。
+    /// dump 状态挂在 socket 上：未收到 `NLMSG_DONE` 就结束会让后续 `NLM_F_DUMP` 永远回 `-EBUSY`，逾时后直接重建最干净。
     #[cfg(target_os = "linux")]
     fn reopen_socket(&mut self) {
         if self.sock_fd >= 0 {
@@ -152,10 +139,7 @@ impl ConntrackManager {
         }
     }
 
-    /// 当 WAN 掉线 / 活跃集合变化时，精准清理这些网卡上的 conntrack 连接。
-    ///
-    /// 多张网卡合并为一次全表 dump（匹配任一 WAN IP 即删除），
-    /// 避免每张网卡各扫一遍完整 conntrack 表。
+    /// WAN 掉线 / 活跃集合变化时清理这些网卡上的连线：多张网卡合并为一次全表 dump，避免每张各扫一遍。
     pub fn flush_interfaces_conntrack(
         &mut self,
         ifaces: &[(String, Option<Ipv4Addr>)],
@@ -167,9 +151,7 @@ impl ConntrackManager {
             match crate::netlink::util::get_interface_ipv4(ifname) {
                 Ok(ip) => ips.push(ip),
                 Err(e) => {
-                    // 介面已消失或正在重拨（PPPoE/USB）时现查会失败。用 DOWN 判定时
-                    // 记下的最后已知 IP 才清得到 NAT 到旧位址的连线——这正是长连线
-                    // 卡死最需要清理的场景。
+                    // 介面已消失或正在重拨（PPPoE/USB）时现查会失败；改用 DOWN 时记下的最后已知 IP 才清得到旧位址长连线。
                     if let Some(ip) = last_known {
                         debug!(
                             "[Conntrack] Could not query IP for {ifname} ({e}); \
@@ -186,8 +168,7 @@ impl ConntrackManager {
             }
         }
         if ips.is_empty() {
-            // 全部介面都查不到 IPv4。回 Ok(0) 会让主回圈误以为「本次 DOWN 已清理完成」，
-            // 整段 DOWN 期间不再重试；回 Err 让它保持 dirty，等位址回来或限流期过后再清。
+            // 查不到 IPv4 必须回 Err 让主回圈保持 dirty 重试；回 Ok(0) 会被当成 DOWN 期间已清理完成。
             return Err(io::Error::other(format!(
                 "no IPv4 address could be resolved for [{}]; will retry while the link stays down",
                 names.join(", ")
@@ -213,7 +194,6 @@ impl ConntrackManager {
 
     #[cfg(target_os = "linux")]
     fn flush_by_ips(&mut self, target_ips: &[Ipv4Addr]) -> io::Result<usize> {
-        // socket 上次重建失败时在这里补救
         if self.sock_fd < 0 {
             self.reopen_socket();
             if self.sock_fd < 0 {
@@ -223,7 +203,6 @@ impl ConntrackManager {
             }
         }
 
-        // 1. 发送 DUMP 请求取得所有当前 conntrack 连线
         self.seq = self.seq.wrapping_add(1);
         let dump_seq = self.seq;
         let nlmsg_type = (NFNL_SUBSYS_CTNETLINK << 8) | IPCTNL_MSG_CT_GET;
@@ -247,22 +226,13 @@ impl ConntrackManager {
             )));
         }
 
-        // 2. 边接收边下发删除，避免把整张表暂存在记忆体里。
-        //
-        //    注意：批量 send 之后「不能」顺手排空接收伫列——此时伫列里排著的
-        //    不只是删除失败的错误回复，还有核心预先填充好的后续 dump 资料块
-        //    （核心会把伫列填到接近 rcvbuf），整块丢弃会让 flush 只扫到表的
-        //    一小部分，漏删后又得重扫全表。这里改为在解析循环内以 nlmsg_seq
-        //    区分讯息：seq == dump_seq 的错误代表 dump 本身失败，
-        //    其余错误（失败的删除回复）直接忽略继续收 dump。
+        // 边收边删避免整表暂存；批量 send 后不可排空接收伫列（里面还有核心预填的后续 dump 资料块），改以 nlmsg_seq 区分。
         let mut recv_buf = vec![0u8; DUMP_BUF_SIZE];
         let expected_type = (NFNL_SUBSYS_CTNETLINK << 8) | IPCTNL_MSG_CT_NEW;
         let mut batch: Vec<u8> = Vec::with_capacity(DELETE_BATCH_LIMIT + 64);
         let mut deleted: usize = 0;
-        // dump 是否确实收到 NLMSG_DONE（逾时／错误中断时为 false）
         let mut dump_done = false;
-        // 第一个遇到的错误：删除发送失败、dump 被核心拒绝、逾时或讯息截断。
-        // 有值就代表这次 flush 不完整，必须让呼叫端知道并重试。
+        // 有值代表这次 flush 不完整，必须让呼叫端知道并重试。
         let mut first_err: Option<io::Error> = None;
 
         'outer: loop {
@@ -279,7 +249,6 @@ impl ConntrackManager {
                 if e.kind() == io::ErrorKind::Interrupted {
                     continue;
                 }
-                // 逾时（SO_RCVTIMEO）或其它接收错误：dump 没有走完，资料不完整
                 if first_err.is_none() {
                     first_err = Some(if e.kind() == io::ErrorKind::WouldBlock {
                         io::Error::new(
@@ -311,8 +280,7 @@ impl ConntrackManager {
                 };
                 let msg_len = msg_hdr.nlmsg_len as usize;
                 if msg_len < NlMsgHdr::LEN || offset + msg_len > len {
-                    // 讯息被截断（单则讯息大于接收缓冲区）：这一则会漏掉。
-                    // datagram 框架本身仍是对齐的，继续收完 dump，最后回报失败重试。
+                    // 单则讯息大于缓冲区会被截断而漏掉；datagram 框架仍对齐，继续收完 dump 再回报失败。
                     if first_err.is_none() {
                         first_err = Some(io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -330,7 +298,6 @@ impl ConntrackManager {
                 }
                 if msg_hdr.nlmsg_type == libc::NLMSG_ERROR as u16 {
                     if msg_hdr.nlmsg_seq == dump_seq {
-                        // dump 请求本身失败（例如上一次未完成的 dump 残留 → EBUSY）
                         if first_err.is_none() {
                             first_err = Some(Self::nlmsgerr_to_io_error(
                                 &recv_buf[offset..offset + msg_len],
@@ -344,7 +311,6 @@ impl ConntrackManager {
                 }
 
                 if msg_hdr.nlmsg_type == expected_type {
-                    // 上一轮 flush 残留的陈旧资料直接跳过（seq 对不上本次 dump）
                     if msg_hdr.nlmsg_seq != dump_seq {
                         offset = next_offset;
                         continue;
@@ -356,7 +322,6 @@ impl ConntrackManager {
                             Self::extract_matching_orig_tuple(attrs_slice, target_ips)
                         {
                             self.seq = self.seq.wrapping_add(1);
-                            // 就地把删除讯息写进批量缓冲（tuple 直接借用切片，零额外拷贝）
                             Self::append_delete_msg(
                                 &mut batch,
                                 self.seq,
@@ -366,9 +331,7 @@ impl ConntrackManager {
                             deleted += 1;
 
                             if batch.len() >= DELETE_BATCH_LIMIT {
-                                // 单批发送失败不中断 dump：先把 dump 收完（否则核心
-                                // 会卡在「dump 进行中」，下次 flush 永远 EBUSY），
-                                // 记下第一个错误，函式最后一并回报。
+                                // 发送失败也不中断 dump（否则核心卡在 dump 进行中，下次永远 EBUSY），记下错误最后回报。
                                 if let Err(e) = Self::flush_delete_batch(self.sock_fd, &mut batch) {
                                     if first_err.is_none() {
                                         first_err = Some(e);
@@ -389,8 +352,7 @@ impl ConntrackManager {
             }
         }
 
-        // dump 完整走完才排空残留回应。若中途失败，核心可能还在做这个 dump：
-        // 重建 socket 把残留的 dump 状态连同资料一起丢弃，下一次 flush 才不会撞 EBUSY。
+        // 只有 dump 完整走完才排空残留回应；中途失败得重建 socket 丢掉残留 dump 状态，否则下次撞 EBUSY。
         if dump_done {
             Self::drain_nonblocking(self.sock_fd);
         } else {
@@ -424,16 +386,13 @@ impl ConntrackManager {
         }
     }
 
-    /// 就地把一条 DELETE 讯息写进批量缓冲区。
-    /// 相比「每条讯息 build_msg 分配一个 Vec 再 extend 进 batch」，
-    /// 省掉每条一次堆分配和两次 memcpy。
+    /// 就地写入批量缓冲：tuple 借用切片，省掉每条讯息的堆分配与两次 memcpy。
     #[cfg(target_os = "linux")]
     fn append_delete_msg(batch: &mut Vec<u8>, seq: u32, tuple_bytes: &[u8], zone: u16) {
-        // tuple +（zone != 0 时）CTA_ZONE；zone 0 是预设值，不必显式带
+        // zone 0 是预设值，不必显式带
         let zone_attr_len = if zone != 0 { 4 + 2 } else { 0 };
         let msg_len = NlMsgHdr::LEN + NfGenMsg::LEN + tuple_bytes.len() + zone_attr_len;
-        // netlink 批次内每则讯息需 4 位元组对齐：nlmsg_len 填实际长度，
-        // 剩余部分补零作为对齐填充（核心以 NLMSG_ALIGN 前进）
+        // netlink 批次内每则讯息需 4 位元组对齐：nlmsg_len 填实际长度，余下补零。
         let padded_len = nlmsg_align(msg_len);
         let start = batch.len();
         batch.resize(start + padded_len, 0);
@@ -464,7 +423,6 @@ impl ConntrackManager {
         }
     }
 
-    /// 组出一则 nfnetlink 讯息（nlmsghdr + nfgenmsg + payload）
     #[cfg(target_os = "linux")]
     fn build_msg(&self, nlmsg_type: u16, flags: u16, payload: &[u8]) -> Vec<u8> {
         let total_len = NlMsgHdr::LEN + NfGenMsg::LEN + payload.len();
@@ -489,7 +447,6 @@ impl ConntrackManager {
         buf
     }
 
-    /// 一次 send 把整批删除讯息送出去（netlink 允许单一 datagram 携带多则讯息）
     #[cfg(target_os = "linux")]
     fn flush_delete_batch(sock_fd: libc::c_int, batch: &mut Vec<u8>) -> io::Result<()> {
         if batch.is_empty() {
@@ -497,8 +454,7 @@ impl ConntrackManager {
         }
 
         let buf_len = batch.len();
-        // netlink 对单一 datagram 是全有或全无。真的出现部分发送时，补送剩余位元组
-        // 会让接收端把半条讯息当成新讯息解析；一律视为失败让呼叫端整批重试。
+        // datagram 全有或全无：部分发送不可补送（接收端会把半条讯息当新讯息），一律视为失败整批重试。
         let n = unsafe { libc::send(sock_fd, batch.as_ptr() as *const libc::c_void, buf_len, 0) };
         batch.clear();
         if n < 0 {
@@ -512,7 +468,6 @@ impl ConntrackManager {
         Ok(())
     }
 
-    /// 以非阻塞方式把接收伫列读干净，避免核心回应堆积导致后续 send 阻塞
     #[cfg(target_os = "linux")]
     fn drain_nonblocking(sock_fd: libc::c_int) {
         let mut buf = [0u8; 4096];
@@ -531,9 +486,7 @@ impl ConntrackManager {
         }
     }
 
-    /// 从 ctnetlink 属性流中找出与任一 target_ip 匹配的 CTA_TUPLE_ORIG 属性块。
-    /// 回传 `(start, end, zone)`：属性块区间由呼叫端以切片借用（零拷贝），
-    /// zone 要原样带回删除讯息，否则非 0 zone 的条目删不到（甚至误删 zone 0）。
+    /// 找出匹配任一 target_ip 的 CTA_TUPLE_ORIG 区间并回传 zone：区间以切片借用（零拷贝），zone 不回填就删不到条目。
     fn extract_matching_orig_tuple(
         attrs: &[u8],
         target_ips: &[Ipv4Addr],
@@ -562,7 +515,6 @@ impl ConntrackManager {
             let data = &attrs[offset + nfa_hdr_len..offset + attr_len];
 
             if attr_type == CTA_TUPLE_ORIG {
-                // 记录整个 CTA_TUPLE_ORIG 属性块的位置
                 orig_range = Some((offset, offset + attr_len));
                 if Self::tuple_matches_ip(data, target_ips) {
                     matched = true;
@@ -581,8 +533,7 @@ impl ConntrackManager {
             .filter(|_| matched)
     }
 
-    /// 检查 tuple 内部 IP 是否命中任一 target_ip
-    /// (SNAT 后的 WAN IP 会出现在 REPLY 的 dst 或 ORIG 的 src)
+    /// tuple 内 IP 命中任一 target_ip 即算匹配（SNAT 后的 WAN IP 出现在 REPLY dst 或 ORIG src）
     fn tuple_matches_ip(tuple_data: &[u8], target_ips: &[Ipv4Addr]) -> bool {
         let nfa_hdr_len = 4;
         let mut offset = 0;
@@ -604,7 +555,6 @@ impl ConntrackManager {
             let data = &tuple_data[offset + nfa_hdr_len..offset + attr_len];
 
             if attr_type == CTA_TUPLE_IP {
-                // 解析 IP 内层属性
                 let mut ip_offset = 0;
                 while ip_offset + nfa_hdr_len <= data.len() {
                     let ip_attr_len = match read_u16(data, ip_offset) {
@@ -662,7 +612,6 @@ mod tests {
     #[test]
     fn test_tuple_matches_ip() {
         let ip = Ipv4Addr::new(10, 0, 0, 5);
-        // CTA_TUPLE_IP -> { CTA_IP_V4_SRC = 10.0.0.5 }
         let mut inner = nf_attr(CTA_IP_V4_SRC, &[10, 0, 0, 5]);
         inner.extend_from_slice(&nf_attr(CTA_IP_V4_DST, &[8, 8, 8, 8]));
         let tuple = nf_attr(CTA_TUPLE_IP, &inner);
@@ -692,19 +641,16 @@ mod tests {
         let mut attrs = orig.clone();
         attrs.extend_from_slice(&reply);
 
-        // REPLY tuple 里出现 WAN IP（SNAT 情境）时也应匹配，并回传 ORIG 区间
         let extracted = ConntrackManager::extract_matching_orig_tuple(&attrs, &[ip]);
         assert_eq!(extracted, Some((0, orig.len(), 0)));
         let (start, end, _zone) = extracted.unwrap();
         assert_eq!(&attrs[start..end], &orig[..]);
 
-        // 多目标：任一 IP 命中即匹配
         assert!(
             ConntrackManager::extract_matching_orig_tuple(&attrs, &[Ipv4Addr::new(1, 2, 3, 4), ip])
                 .is_some()
         );
 
-        // 不相关的 IP 不应匹配
         assert!(
             ConntrackManager::extract_matching_orig_tuple(&attrs, &[Ipv4Addr::new(1, 2, 3, 4)])
                 .is_none()

@@ -102,7 +102,8 @@
 - **严格防震荡机制（Hysteresis）**：
   - 当线路处于 DOWN 时，必须**连续成功** `recovery_success_count` 次（预设 5）、
     且 RTT 正常，才能恢复为 UP。
-  - 恢复判据**不再包含窗口丢包率**：`loss_threshold_up`（旧栏位，保留仅为相容设定档）
+  - 恢复判据**不再包含窗口丢包率**：`loss_threshold_up`（旧栏位，daemon 只在设定档里
+    接受它、不做任何判断，仅为相容旧设定档；新版 UCI 预设档、init 模板与范例 JSON 都已不再写出）
     与 `window_size` 耦合——`window_size = 10`、门槛 10% 时等于「窗口内最多 1 次失败」，
     于是 DOWN（尾部 3 连败触发）要连续 **9** 次成功才能恢复，把配置的
     `recovery_success_count = 5` 静默抬成 9（实测日志正是 `Consecutive successes: 9`），
@@ -114,7 +115,8 @@
     但它**仍持续探测**，品质恢复后自动回到 ECMP。介于降级门槛与判死门槛（0.50）
     之间的线路不会被判 DOWN，旧版会让它照样吃一半流量（实测 20% 丢包时主表仍是
     两条 nexthop 的 ECMP）。为避免「全部线路都降级 → 完全没有预设路由」，
-    此时会**保底**取 metric 最小的 Up 线承载并印出一次 warn。状态档的 `degraded`
+    此时会**保底**取**实测丢包最低**的 Up 线承载（同分再比 metric 与设定顺序）并印出一次
+    warn——按设定顺序随便挑一条会把全部流量压到可能更差的那条线上。状态档的 `degraded`
     栏位可看出某条线是否正被排除。
   - **降级带双门槛迟滞 + 最短连续保持**（`degrade_hysteresis` 预设 0.10、
     `degrade_exit_samples` 预设 6）：**进入**降级看 `degrade_loss_threshold`（20%），
@@ -154,14 +156,38 @@
   - 线路恢复：原子化切回双路 ECMP 负载均衡。
 - **全部断线时的语意（实测决定）**：
   - 若主表**只有我们这一条**预设路由 → **保留**（删掉会让整机含所有 LAN 客户端完全没有出口）；
-  - 若主表**还有别人的预设路由**（例如 netifd 的 metric 10/50）→ **删掉我们这条，让兜底接手**。
-    原因：载波掉（拔网线、对端下线，介面仍是 UP）时内核**不会**自己移除「dev 指向该设备」的路由，
-    它只是标成 linkdown 并继续胜过 metric 更大的兜底，流量会一直被送往死链路。
-  - 因为探针有自己的独立表（不依赖这条预设路由），删掉它不会让 daemon 失去探测能力。
+  - 若主表**还有别人的预设路由**（例如 netifd 的 metric 10/50）→ 只有在**内核把我们的路由标成
+    linkdown**（`rtm_flags & RTNH_F_LINKDOWN`，`ip route show` 会印出 `linkdown`）时，
+    才**删掉我们这条、让兜底接手**。原因：载波掉（拔网线、对端下线、装置消失）时内核**不会**
+    自己移除「dev 指向该设备」的路由，它只是标成 linkdown 并继续胜过 metric 更大的兜底，
+    流量会一直被送往死链路；这时撤掉才有意义。
+  - **探针超时（LQE 判 DOWN）本身不足以撤掉预设路由**。探针超时只证明「这一刻没收到回包」，
+    而撤掉唯一那条 metric 0 的路由，会把全部流量交给另一张网卡上的兜底路由（换 device＝换 NAT
+    源 IP＝既有连线全断），而那条兜底我们从来没验证过能不能上网。实测（校园网、单线、兜底是同一
+    校园网里另一张未认证的端口）旧行为**每 6 分钟断一次**，危害远大于误判本身。改成「只有 linkdown
+    才撤」之后，同样的事件（先用 nft 丢掉两条线的探针 TCP/53、把两条线都判死，再恢复）对 LAN 客户端
+    **零感知**：85 秒 68 次 HTTP 请求只有 1 次超时，且发生在事件之前。
+  - 探针有自己的独立表（不依赖这条预设路由），保留它不会让 daemon 失去探测能力；
+    线路真的掉载波时仍会按上面的规则撤除，兜底照样接手。相关回归测试
+    （dummy 不掉载波 → 保留；veth 关掉 peer 制造真载波丢失 → 撤除）见
+    `src/netlink/route/netns_tests.rs` 的 `netns_route_lifecycle` G 段。
 - **失败可感知、可自愈**：netlink worker 会把每次下发的成功／失败回报主回圈；
   失败时不更新「已下发」记录，并在数秒后重下同一份期望状态（同一个错误只告警一次，
   之后每 20 次提醒一次，避免永久失败时把 logd 环形缓冲刷掉）。此外每 30 秒有一次
   心跳重下（幂等），修复被其它程序或内核事件改动的路由。
+- **等价替换会被跳过**：下发的成员／权重与上一次完全相同、变体已落定、而且核心里确实还有
+  我们那条路由（`dump_default_routes` 查得到 metric == `route_priority`）时，直接跳过 netlink 写入。
+  探针路径每 48 秒的周期刷新、以及**只有一个成员时**的权重重算，都会走到这条路径；旧版会把这些
+  等价替换真的下发（实测每 48 秒一次、每次 4 行日志），新版实测 **60 秒内 0 次路由变动**
+  （`ip monitor route`），也不再有对应的日志噪声。
+- **动态权重因子需要 ≥ 2 个「活跃」成员**：`weight_mode: quality` / `load_aware` / 容量比例
+  在只有一条线（或另一条线正 DOWN）时会自动停用。权重的作用是把流量在成员之间挪动，
+  单成员下 256 个 bucket 全指向同一个 nexthop，每次权重变更只是等价重写一条 FIB 记录
+  （实测单线每 2 秒一次）；启动时也会 warn 一次提醒使用者补第二条线。
+- **核心回收的 nexthop 不再当失败**：装置掉载波（或消失）时，内核会自己把 nexthop object
+  连同引用它的 nh-id 路由一起收走；此后按 nhid 删路由会回 **EINVAL**（`Nexthop id does not exist`），
+  旧版把它当失败并「保留 group 等下次重试」，于是 `installed_variant` 永远停在 `resilient`、
+  每个 tick 重试一次注定失败的删除。现在这种 EINVAL 视为「已经被核心收走」，直接清干净状态。
 - **退出语意**：`remove_routes_on_exit` 预设 `false`——服务重启／升级的窗口内保留预设路由，
   避免整网瞬断；设为 `true` 时也**只会删掉自己真的下发过的那条**（从未接管过就不碰 netifd 的路由）。
   无论设定为何，**探针路径（独立表内的路由、`oif` 规则、主表探针 `/32`）与隧道 underlay
@@ -262,6 +288,13 @@ IPv6 那一份）。**预设 `l4`（r10 起）**；明确写 `null`（或 UCI �
 > 一起写进 log 与状态档（`hash.policy` / `hash.fields` / `hash.l3_only`），
 > 让「设定档写了 l4」与「内核真的按连线分流」这两件事能被分辨。
 
+**定期自我修复（r12）**：`fib_multipath_hash_policy` 是 per-netns 的 sysctl，任何
+开机脚本、factory reset 或其它工具都能把它改回 L3——守护进程原本只在启动时写一次，
+被改掉后永远发现不了（状态档还会继续显示启动时读到的「l4」，而连线早已全挤在一条线上）。
+因此事件回圈每 30 秒读回一次实际值：与设定不符就 warn 并立刻写回；`multipath_hash_policy`
+写 `null`（不管理）时只更新状态档，**绝不写入**。状态档的 `hash` 栏位也因此反映
+当前真实粒度，而不是开机那一刻的快照。
+
 启动时会读回实际值并印出：
 
 ```text
@@ -278,7 +311,7 @@ LuCI 的标题列也有「哈希粒度」徽章（`l4：按连线分散` / `仅 
 | `l3` | 0 | 只哈希来源／目的 IP | 同一个玩家到同一个伺服器的所有连线黏在同一条线**对游戏最友好**（抖动时不会一半被搬走）；代价是视频 CDN 的多条连线也只用到一条 WAN |
 | `l4` | 1 | 再加上 L4 来源／目的埠 | **预设**；分流最均匀（视频、多执行绪下载、P2P） |
 | `inner` | 2 | L3 + 隧道内层标头 | 只有 VXLAN/GRE 等封装流量受益；一般网页/视频流量等同 `l3` |
-| `null` / 空 | 不写入 | 沿用系统预设 | 想自己管这个内核开关时 |
+| `null` / 空 | 不写入 | 沿用系统预设 | 想自己管这个内核开关时（**只能从 UCI / JSON 设定**：LuCI 的下拉选单只留 `l4` / `l3` / `inner`，避免误选到等同 L3 的预设） |
 | （旧设定档没有这个栏位） | — | **= `l4`（r10 的新预设）** | — |
 
 - 变更需重启服务；写入失败（旧内核没有这些档案、或 `/proc` 不可写）只告警，不影响启动。
@@ -300,7 +333,14 @@ LuCI 的标题列也有「哈希粒度」徽章（`l4：按连线分散` / `仅 
 ```
 
 - 演算法：`factor = (1 - 窗口丢包率) × clamp(最佳 RTT / 本线 RTT, min_ratio, 1.0)`，
-  等效权重 = `clamp(round(设定 weight × factor), 1, 255)`；窗口未填满或没有 RTT 样本时不惩罚。
+  等效权重 = `clamp(round(设定 weight × 刻度 × factor), 1, 255)`；窗口未填满或没有 RTT 样本时不惩罚。
+- **整数刻度（r9）**：权重都是预设 1 时 `round(1 × 0.25)` 会被夹成 1，品质模式等于没开。
+  因此只要品质因子或负载因子会下修，守护进程就把整组基准权重放大到至少 4 格
+  （`weight` 1:1 → 4:4，**比例不变**、只是刻度变细），下修才真的产生整数差。
+  若放大后会把最大权重推过 255（容量比例超过 255:1），则保持原刻度以确保比例精确。
+- **容量基准稳定（r9）**：启用 `max_mbps` 时，权重比例以**所有线**的最小容量正规化，
+  而不是「当前承载线」的最小容量——后者在一条线降级/DOWN 时会让存活线的绝对权重改变
+  （比例其实没变），白白触发一次路由重下（standard 模式下这次重下会重算 hash、搬走大量连线）。
 - 更新有限速（`dynamic_weight_interval_ms`，预设 10 秒）：每次变更都会重下 ECMP 路由，
   内核可能重算 multipath hash，过于频繁会反复打断既有 flow。
   **在实际安装的是 `standard`（明确设定 `standard`，或 `auto` 在旧核心上退回）时，动态因子会被整个忽略**
@@ -427,7 +467,8 @@ ECMP 只按 flow 哈希，即使权重按频宽设好，也可能因为 flow 分
   所以「稍微过载」只小幅下修、真的打满才压到 `dynamic_weight_min_ratio`。
 - **刻度放大**：权重都是 1 时 `round(1 × 0.25)` 会被夹成 1，下修等于没效果。
   有线被下修时会把整组基准权重放大到至少 4 格（比例不变、只是刻度变细），
-  且不会超过 255；压力解除就还原。
+  且不会超过 255（超过则保持原刻度以保住精确比例）；压力解除就还原。
+  品质模式（`weight_mode: quality`）走同一套刻度，所以预设 `weight = 1` 的机器也能生效。
 - **与品质感知叠加**：`weight_mode: "quality"` 与 `load_aware` 可同时开启，
   合成因子 = 品质因子 × 负载因子。
 - **更新节奏**：沿用 `dynamic_weight_interval_ms`（预设 10 秒）限速，每次变更是一次
@@ -621,7 +662,6 @@ ssh root@192.168.1.1 "mwan4 --check-config /etc/mwan4/mwan4.json"
   "probe_timeout_ms": 400,
   "window_size": 10,
   "loss_threshold_down": 0.5,
-  "loss_threshold_up": 0.1,
   "degrade_loss_threshold": 0.2,
   "degrade_hysteresis": 0.1,
   "degrade_exit_samples": 6,
@@ -708,33 +748,54 @@ ssh root@192.168.1.1 "mwan4 --check-config /etc/mwan4/mwan4.json"
 /etc/init.d/mwan4 start
 ```
 
+> `/etc/config/mwan4` 的 `global.enabled` 未设定时视为**启用**（与 LuCI 表单的预设一致）；
+> 要停用守护进程请明确写 `option enabled '0'`，或直接 `/etc/init.d/mwan4 disable`。
+
 ### 步骤 4：查看运作日志与监控状态
 ```bash
 # 即时滚动日志
 logread -f -e mwan4
 ```
 
-输出范例：
+输出范例（实机，双线 `ecmp_mode=auto`）：
 ```text
-2026-09-12 21:40:00 info mwan4: Starting mwan4 daemon (Probe interval: 500ms, Timeout: 400ms, Window: 10, Hysteresis: 5 success, ECMP mode: Standard)
-2026-09-12 21:40:00 info mwan4: Mapped interface wan1 -> ifindex 2
-2026-09-12 21:40:00 info mwan4: Mapped interface wan2 -> ifindex 3
-2026-09-12 21:40:00 info mwan4: [wan1] Initial link probe succeeded -> UP (RTT: 18.25ms)
-2026-09-12 21:40:00 info mwan4: [wan2] Initial link probe succeeded -> UP (RTT: 22.40ms)
-2026-09-12 21:40:00 info mwan4: [RouteManager] Atomic FIB Switch: ECMP Multipath default route [nexthop via 192.168.1.1 dev wan1 (w:1) nexthop via 192.168.2.1 dev wan2 (w:1)]
-2026-09-12 21:40:00 info mwan4: [RouteManager] Kernel FIB route successfully committed.
-2026-09-12 21:40:05 info mwan4: [wan1] State: UP, Loss: 0.0%, RTT: 17.80ms, Jitter: 0.42ms (Successes: 10, Timeouts: 0)
-2026-09-12 21:40:05 info mwan4: [wan2] State: UP, Loss: 0.0%, RTT: 21.95ms, Jitter: 0.55ms (Successes: 10, Timeouts: 0)
+2026-10-07 00:18:26 info mwan4: Starting mwan4 daemon (Probe interval: 800ms, Timeout: 500ms, Window: 10, Hysteresis: 5 success, ECMP mode: Auto)
+2026-10-07 00:18:26 info mwan4: Mapped interface eth1 -> ifindex 3
+2026-10-07 00:18:26 info mwan4: Mapped interface wireguard_wan -> ifindex 24
+2026-10-07 00:18:26 info mwan4: Multipath hash in effect (ipv4): policy=1 fields=31 (src_ip+dst_ip+ip_proto+src_port+dst_port)
+2026-10-07 00:18:26 info mwan4: Subscribed to kernel link/address events (RTNLGRP_LINK + IFADDR)
+2026-10-07 00:18:26 info mwan4: mwan4 event loop running. Press Ctrl+C to terminate.
+2026-10-07 00:18:26 info mwan4::lqe: [eth1] Initial link probe succeeded -> UP (RTT: 36.31ms)
+2026-10-07 00:18:26 info mwan4::lqe: [wireguard_wan] Initial link probe succeeded -> UP (RTT: 7.23ms)
+2026-10-07 00:18:26 info mwan4: Active WAN set changed: None -> [3, 24] [eth1#3:UP in | wireguard_wan#24:UP in]
 ```
 
-当 `wan1` 断线时日志范例：
+> **常态输出刻意留白**：每次下发的细节（`[RouteManager] ... committed.`、`Atomic FIB Switch`、
+> `Dynamic ECMP weights updated`）与每 10 拍的状态摘要（`[wan1] State: UP, Loss: ...`）都是
+> **debug**。旧版把这些印在 info，实测 128KB 的 logd 环形缓冲里 **91% 的条目来自本程式**、
+> 只装得下 27 分钟，其它服务的日志全被挤掉；新版稳态下只在「状态变化」时输出（启动、
+> 链路上下、降级、撤路由决策、错误），实测同一缓冲可回溯 **52 分钟**、稳态每分钟约 0 行。
+> 需要逐拍细节（探针、RTT、权重重算）时把 `RUST_LOG=debug` 加进
+> `/etc/init.d/mwan4` 的 `procd_set_param env` 再重启服务即可（`env_logger` 读这个环境变量；
+> 单实例锁会挡住「另外前台跑一份」的作法）。
+
+当 `eth1` 断线（或探针判死）、以及**两条线同时被判死**时，实机日志范例：
 ```text
-2026-09-12 21:40:20 warn mwan4: [wan1] Link state transitioned: UP -> DOWN (Timeouts: 3, Loss: 30.0%, RTT: Some(18.2))
-2026-09-12 21:40:20 info mwan4: [Conntrack] Flushing active conntrack sessions for wan1 (IP: 192.168.1.100)...
-2026-09-12 21:40:20 info mwan4: [Conntrack] Successfully deleted 42 conntrack entries for IP 192.168.1.100
-2026-09-12 21:40:20 info mwan4: [RouteManager] Atomic FIB Switch: Single default route via wan2 (3) dev wan2 [gw: 192.168.2.1]
-2026-09-12 21:40:20 info mwan4: [RouteManager] Kernel FIB route successfully committed.
+00:19:20 warn  mwan4::lqe: [eth1] Link state transitioned: UP -> DOWN (reason: consecutive_timeouts | timeouts: 3 (fail threshold 3) | window loss: 30.0% (down threshold 50.0%) | RTT: Some(31.56) (max 1500ms))
+00:19:20 info  mwan4: Active WAN set changed: Some([3, 24]) -> [24] [eth1#3:DOWN out | wireguard_wan#24:UP in]
+00:19:29 warn  mwan4::lqe: [wireguard_wan] Link state transitioned: UP -> DOWN (...)
+00:19:29 info  mwan4: Active WAN set changed: Some([24]) -> [] [eth1#3:DOWN out | wireguard_wan#24:DOWN out]
+00:19:29 warn  mwan4::netlink::route: [RouteManager] ALL WAN LINKS DOWN by probe, but every managed interface is still
+              link-up (["wireguard_wan"]): KEEPING the IPv4 default route instead of handing all traffic to the unverified
+              fallback route(s) with metric [5, 10]. Probe timeouts alone are not proof of carrier loss; withdrawing the
+              metric-0 route would change the NAT source IP and break every established flow.
+00:19:34 warn  mwan4::lqe: [eth1] Line degraded: removed from ECMP (window loss 100.0% >= threshold 20.0% for 20 consecutive samples, 10 failures in the last 10 samples). It keeps being probed and rejoins ECMP automatically once it recovers (at least 20 samples out).
+00:19:39 info  mwan4::lqe: [eth1] Link state recovered: DOWN -> UP (Consecutive successes: 5, Loss: 50.0%, RTT: 30.50ms, ...)
+00:19:48 info  mwan4: Active WAN set changed: Some([3]) -> [3, 24] [eth1#3:UP in | wireguard_wan#24:UP in]
 ```
+（`ALL WAN LINKS DOWN ... KEEPING` 这一行是「探针判死但链路层还活着」时的固定输出；
+只有在核心把我们的路由标成 `linkdown` 时才会改用 `removing the mwan4 IPv4 default route ...`
+的语意，让兜底接手。）
 
 ---
 
@@ -744,16 +805,32 @@ logread -f -e mwan4
 
 ### 界面特色：
 1. **即时健康监控看板**：
-   - 顶部显示守护进程状态（🟢 运行中 / 🔴 已停止）与内核 FIB 路由状态（ECMP / 单线容灾）。
-   - 网卡卡片网格即时展示各 WAN 的状态徽章（UP/DOWN）、即时 RTT 延迟、Jitter 抖动、滑动窗口丢包率进度条、连续成功/超时计数。
-   - 5 秒非同步轮询自动刷新（离开页面时自动停止），无需手动重新整理网页。
-2. **分流粒度可验证**：标题列新增「哈希粒度」徽章，直接显示内核**实际生效**的
+   - 顶部状态列以胶囊徽章显示守护进程状态（🟢 运行中 / 🔴 已停止）、内核 FIB 路由
+     状态、状态档新鲜度、生效中的策略与哈希粒度。
+   - 概况砖显示在线 WAN 数（`2 / 2`）与全部 WAN 的**合计速率**（↑/↓）。
+   - 网卡卡片网格即时展示各 WAN 的状态徽章（UP/DOWN/降级）、即时 RTT、Jitter、
+     TX/RX 速率、滑动窗口丢包率进度条与连续成功/超时计数。
+   - 每张卡片带一条 **RTT 趋势图**（60 个样本 × 5 秒 ≈ 最近 5 分钟，随轮询从左往右
+     生长；柱高为 RTT、颜色综合 RTT 与丢包等级），单看当前数值看不出的「慢慢变差」
+     或「偶发尖峰」直接看得见。趋势只存在浏览器端，重新载入页面即重新累积。
+   - 资料过期或本机条件错误会直接标注在卡片上，不会把「最后一次快照」伪装成即时状态。
+   - 5 秒非同步轮询自动刷新（只就地更新数值与柱状图，不重建 DOM；离开页面时自动停止）。
+2. **分流粒度可验证**：状态列显示「哈希粒度」徽章，直接回报内核**实际生效**的
    policy/fields（读回值）。`仅 L3：同一目的 IP 只走一条 WAN` 就是把视频流量挤在
    一条线上的元凶（见 §6.1）。
 3. **直观易用的 UCI 配置表单**：
-   - 全域参数（探测周期、超时、窗口大小、防震荡次数、Conntrack 自动清理）。
+   - 全域参数（探测周期、超时、窗口大小、防震荡次数、ECMP 模式、权重模式、
+     降级门槛、哈希粒度、Conntrack 自动清理）。
    - 表格式网卡列表（直接关联系统网卡下拉选单、网关 IP、ECMP 权重、动态探测目标列表）。
    - 点击「保存并应用」自动触发 procd 重新载入，无缝生效。
+
+> 刻意**不**放进 LuCI 的选项：`remove_routes_on_exit`（部署取向、预设关闭且删路由有断网风险）、
+> `dynamic_weight_min_ratio` / `load_target_ratio` / `load_recover_ratio`（专家调参，
+> 预设值已适用于绝大多数线路），以及已被移除的空白「不写入内核」哈希选项
+> （与 `l3` 重复且容易误选）。这些仍可用 UCI 或 JSON 直接设定。
+> 反之，`allow_dynamic_weights_on_standard` 现在可以在 LuCI 的 Advanced 分页调整
+> （只在 `ecmp_mode = standard` 时出现），否则 `weight_mode` / `load_aware` 在
+> standard 下会被静默忽略而使用者无从得知。
 
 ### 手动安装 LuCI 界面至路由器：
 ```bash
@@ -933,6 +1010,9 @@ underlay 走 DHCP 时，隧道只要绑定 `tunlink`（netifd 会在 WAN 变化�
 - **`multipath_hash_policy` 预设从「不写入」改成 `l4`（r10）**：升级后若设定档里
   明写 `null`（UCI 的 `option multipath_hash_policy ''`）则行为不变（仍是 L3 粒度），
   启动时会 warn 一次提醒你视频 CDN 的多条连线只会走一条 WAN。见 §6.1 的升级提醒。
+- **哈希粒度会被定期重新校验（r12）**：每 30 秒读回一次 `fib_multipath_hash_policy`，
+  被开机脚本／factory reset／其它工具改掉时会 warn 并写回；设定 `null` 时只回报、
+  绝不写入。状态档与 LuCI 的「哈希粒度」徽章因此显示当前真实值而非开机快照。
 - **动态权重会重下路由**：每次权重变更都是一次 `RTM_NEWROUTE`；若内核实际安装的是
   `standard` ECMP，它会重算 multipath hash、既有 flow 可能被改派（实测 40%）。
   预设 `auto` 在支援 nexthop object 的核心上装的是 `resilient`（权重变更实测 0% 改派），

@@ -193,15 +193,18 @@ fn netns_route_lifecycle() {
         "唯一一条预设路由在全断时必须保留"
     );
 
-    // 有兜底路由（metric 100）→ 删掉我们那条，让兜底接手
+    // 全断 + 有兜底路由，但核心并未把我们的路由标成 linkdown（dummy 网卡不掉载波）
+    // → 仍然保留。探针判死只代表「这一刻没收到回包」；撤掉唯一那条 metric 0 的路由会把
+    // 全部流量交给另一张网卡上的兜底路由（换源 IP = 既有连线全断）。载波真掉的撤除路径在 G 段。
     assert!(sh(&[
         "ip", "route", "add", "default", "dev", "mwa1", "metric", "100"
     ]));
-    rm.apply_default_routes(&[]).expect("all-down remove");
+    rm.apply_default_routes(&[])
+        .expect("probe-only all-down must keep the route");
     let r = routes();
     assert!(
-        !r.contains("metric 0"),
-        "全断且有兜底时，我们的 metric 0 预设路由应被移除:\n{r}"
+        r.contains("nexthop dev mwa0") && r.contains("nexthop dev mwa1"),
+        "探针判死但核心未标 linkdown 时，必须保留我们的预设路由:\n{r}"
     );
     assert!(r.contains("metric 100"), "兜底路由必须保留:\n{r}");
 
@@ -240,15 +243,17 @@ fn netns_route_lifecycle() {
     let nh = sh_out(&["ip", "nexthop", "show"]);
     assert!(nh.contains("group"), "缩减成员后 group 应仍存在:\n{nh}");
 
-    // 有兜底 → 全断：必须把 nh-id 路由删掉（P0 修正；旧版用标准 key 删不掉）
+    // 有兜底 + 探针全断，但核心没把 nh-id 路由标成 linkdown → 仍必须保留
+    // （载波真掉的撤除路径在 G 段）
     assert!(sh(&[
         "ip", "route", "add", "default", "dev", "mwb1", "metric", "200"
     ]));
-    rm.apply_default_routes(&[]).expect("resilient all-down");
+    rm.apply_default_routes(&[])
+        .expect("resilient probe-only all-down");
     let r = routes();
     assert!(
-        !r.contains("nhid"),
-        "全断且有兜底时，resilient 预设路由应被移除:\n{r}"
+        r.contains("nhid"),
+        "探针判死但核心未标 linkdown 时，resilient 预设路由必须保留:\n{r}"
     );
     assert!(r.contains("metric 200"), "兜底路由必须保留:\n{r}");
     let _ = sh(&[
@@ -532,6 +537,99 @@ fn netns_route_lifecycle() {
     );
 
     rm_f.cleanup_routes().expect("hash-section cleanup");
+
+    // ---------------------------------------------------------------
+    // G. 探针判死 ≠ 链路失效：只有核心把我们的路由标成 linkdown 才撤预设路由
+    //    A/B 两段用的 dummy 网卡永远不掉载波，走的都是「保留」分支；这一段用 veth
+    //    把 peer 关掉制造真正的载波丢失（核心会在 rtm_flags 打上 RTNH_F_LINKDOWN，
+    //    `ip route show` 印成 linkdown），验证撤除路径仍然有效——否则就是拿掉安全网。
+    // ---------------------------------------------------------------
+    let _dummy_g = Dummies::setup(&[("mwg1", "10.12.0.2/24")]);
+    assert!(sh(&[
+        "ip", "link", "add", "mwg0", "type", "veth", "peer", "name", "mwg0p"
+    ]));
+    assert!(sh(&["ip", "link", "set", "mwg0", "up"]));
+    assert!(sh(&["ip", "link", "set", "mwg0p", "up"]));
+    assert!(sh(&["ip", "addr", "add", "10.11.0.2/24", "dev", "mwg0"]));
+    assert!(sh(&["ip", "addr", "add", "10.11.0.1/24", "dev", "mwg0p"]));
+    // 兜底路由放在另一张（我们没在管的）网卡上，所以出现 linkdown 的只可能是我们那条
+    assert!(sh(&[
+        "ip", "route", "add", "default", "dev", "mwg1", "metric", "100"
+    ]));
+
+    // G1：载波还在 → 探针全断也必须保留我们的路由
+    let mut rm_g = RouteManager::new(4300, EcmpMode::Standard).unwrap();
+    rm_g.apply_default_routes(&[veh("mwg0", 1, vec![])])
+        .expect("veth ECMP apply");
+    assert!(
+        routes().contains("metric 4300"),
+        "veth 预设路由未安装:\n{}",
+        routes()
+    );
+    rm_g.apply_default_routes(&[])
+        .expect("probe-only all-down on veth");
+    let r = routes();
+    assert!(
+        r.contains("metric 4300"),
+        "载波还在时，探针判死不得撤掉预设路由:\n{r}"
+    );
+    assert!(r.contains("metric 100"), "兜底路由必须原样保留:\n{r}");
+
+    // G2：真掉载波 → 核心标 linkdown → 必须撤掉我们那条，让兜底接手
+    assert!(sh(&["ip", "link", "set", "mwg0p", "down"]));
+    let mut waited_ms = 0;
+    while !routes().contains("linkdown") && waited_ms < 3000 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        waited_ms += 50;
+    }
+    let r = routes();
+    assert!(
+        r.contains("linkdown"),
+        "veth peer down 后核心应把经过它的路由标成 linkdown:\n{r}"
+    );
+    rm_g.apply_default_routes(&[])
+        .expect("carrier-loss all-down");
+    let r = routes();
+    assert!(
+        !r.contains("metric 4300"),
+        "载波掉时必须撤掉我们的预设路由，让兜底接手:\n{r}"
+    );
+    assert!(r.contains("metric 100"), "兜底路由必须保留:\n{r}");
+
+    // G3：resilient（生产上 auto 在这个核心装的正是它）也必须能被 linkdown 撤掉；
+    //     若核心只标 nexthop 成员而不标 nh-id 路由本身，这条断言会先失败。
+    assert!(sh(&["ip", "link", "set", "mwg0p", "up"]));
+    let mut rm_g3 = RouteManager::new(4400, EcmpMode::Resilient).unwrap();
+    rm_g3
+        .apply_default_routes(&[veh("mwg0", 1, vec![])])
+        .expect("veth resilient apply");
+    assert!(
+        routes().contains("nhid"),
+        "resilient 预设路由未安装:\n{}",
+        routes()
+    );
+    assert!(sh(&["ip", "link", "set", "mwg0p", "down"]));
+    let mut waited_ms = 0;
+    while !routes().contains("linkdown") && waited_ms < 3000 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        waited_ms += 50;
+    }
+    rm_g3
+        .apply_default_routes(&[])
+        .expect("resilient carrier-loss all-down");
+    let r = routes();
+    assert!(
+        !r.contains("nhid"),
+        "载波掉时 resilient 预设路由也必须撤掉:\n{r}"
+    );
+    assert!(r.contains("metric 100"), "兜底路由必须保留:\n{r}");
+
+    // 收尾：拆掉兜底与 veth，别留给后面的段落
+    let _ = sh(&[
+        "ip", "route", "del", "default", "dev", "mwg1", "metric", "100",
+    ]);
+    let _ = sh(&["ip", "link", "del", "mwg0"]);
+    let _ = rm_g3.cleanup_routes();
 }
 
 /// 回归：nexthop object 的新增/删除必须真的生效。
