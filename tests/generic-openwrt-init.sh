@@ -121,6 +121,56 @@ MOCK_L3="pppoe-wan"
 MOCK_UP=0
 generate_json_config && exit 1 || :
 assert_empty
+# Mock route-save/restore: verify only owned proto-77 MAIN DEFAULT routes
+# are flushed, and that missing original IPv6 routes are not flushed.
+ROUTE_SNAPSHOT_DIR="$TMP/route-snapshots"
+IP_CALLS="$TMP/ip-calls.txt"
+: > "$IP_CALLS"
+ip() {
+    printf '%s\n' "$*" >> "$IP_CALLS"
+    case "$*" in
+        "-4 route show table main default proto 77" |
+        "-6 route show table main default proto 77") return 0 ;;
+        "-4 route save table main default") printf 'BINARY-ORIGINAL-V4'; return 0 ;;
+        "-6 route save table main default") printf 'HEAD'; return 0 ;;
+        "-4 route flush table main default proto 77" |
+        "-4 route restore") return 0 ;;
+        *) echo "unsafe or unexpected ip call: $*" >&2; return 1 ;;
+    esac
+}
+snapshot_default_routes
+[ -s "$ROUTE_SNAPSHOT_DIR/default4.bin" ]
+[ -s "$ROUTE_SNAPSHOT_DIR/default6.bin" ]
+restore_default_routes
+grep -q -- '^-4 route flush table main default proto 77
+basescript="/etc/init.d/mwan4"
+MOCK_ORDER=""
+procd_kill() { MOCK_ORDER="${MOCK_ORDER}kill:$1 "; }
+restore_default_routes() { MOCK_ORDER="${MOCK_ORDER}restore "; }
+rc_procd() { MOCK_ORDER="${MOCK_ORDER}start:$1"; }
+reload_service
+[ "$MOCK_ORDER" = "kill:mwan4 restore start:start_service" ] || {
+    echo "unexpected procd reload order: $MOCK_ORDER" >&2
+    exit 1
+}
+echo "PASS: disabled, empty, manual WAN, netifd IPv4/IPv6, PPPoE policy, down state, reload order"
+ "$IP_CALLS"
+grep -q -- '^-4 route restore
+basescript="/etc/init.d/mwan4"
+MOCK_ORDER=""
+procd_kill() { MOCK_ORDER="${MOCK_ORDER}kill:$1 "; }
+restore_default_routes() { MOCK_ORDER="${MOCK_ORDER}restore "; }
+rc_procd() { MOCK_ORDER="${MOCK_ORDER}start:$1"; }
+reload_service
+[ "$MOCK_ORDER" = "kill:mwan4 restore start:start_service" ] || {
+    echo "unexpected procd reload order: $MOCK_ORDER" >&2
+    exit 1
+}
+echo "PASS: disabled, empty, manual WAN, netifd IPv4/IPv6, PPPoE policy, down state, reload order"
+ "$IP_CALLS"
+! grep -q -- '^-6 route flush' "$IP_CALLS"
+[ ! -e "$ROUTE_SNAPSHOT_DIR/default4.bin" ]
+[ ! -e "$ROUTE_SNAPSHOT_DIR/default6.bin" ]
 # procd reload must restore routing after stop, before restarting daemon.
 basescript="/etc/init.d/mwan4"
 MOCK_ORDER=""
