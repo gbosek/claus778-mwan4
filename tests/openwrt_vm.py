@@ -39,6 +39,11 @@ def serial_command_line(command, marker):
     return line
 
 
+def strip_ansi(text):
+    """Remove terminal control sequences before parsing interactive tty output."""
+    return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+
+
 class Lab:
     def __init__(self, args):
         self.image = pathlib.Path(args.image).resolve()
@@ -434,6 +439,7 @@ class Lab:
             marked = self.cmd(
                 f"ip -4 route get 198.18.0.1 from 192.0.2.10 mark {pbr_mark}"
             )
+            marked = strip_ansi(marked)
             if not re.search(r"\bdev\s+eth2\b", marked):
                 raise AssertionError(
                     f"marked PBR traffic did not select dhcpwan: {marked}"
@@ -445,6 +451,7 @@ class Lab:
             unmarked = self.cmd(
                 "ip -4 route get 198.18.0.1 from 192.0.2.10"
             )
+            unmarked = strip_ansi(unmarked)
             if not re.search(r"\bdev\s+ppp[^\s]*\b", unmarked):
                 raise AssertionError(
                     "unmarked traffic did not retain PPPoE native policy: "

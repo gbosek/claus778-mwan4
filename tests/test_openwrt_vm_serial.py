@@ -6,9 +6,15 @@ import sys
 import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from openwrt_vm import serial_command_line
+from openwrt_vm import serial_command_line, strip_ansi
 
 class SerialCommands(unittest.TestCase):
+    def test_strip_ansi_from_colored_route_device(self):
+        route = "198.18.0.1 dev \x1b[1;36meth2\x1b[0m table pbr_dhcpwan"
+        self.assertEqual(
+            strip_ansi(route), "198.18.0.1 dev eth2 table pbr_dhcpwan"
+        )
+
     def test_foreground_checks_exit_status(self):
         line = serial_command_line("false", "__TEST_")
         self.assertIn("false; rc=$?;", line)
