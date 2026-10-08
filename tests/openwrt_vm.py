@@ -186,15 +186,21 @@ class Lab:
                  "network_get_device pppdev pppwan; test -n \"$pppdev\"; "
                  "ip link show \"$pppdev\"")
         print("PASS: actual PPPoE session established using TAP link", flush=True)
-        self.cmd("uci set mwan4.global.enabled=1; "
-                 "uci set mwan4.global.route_priority=10; "
-                 "uci set mwan4.global.ecmp_mode=standard; "
-                 "uci set mwan4.ppp=interface; uci set mwan4.ppp.network=pppwan; "
-                 "uci add_list mwan4.ppp.probe_targets=100.64.1.1:8093; "
-                 "uci set mwan4.ppp.weight=2; "
-                 "uci set mwan4.dhcp=interface; uci set mwan4.dhcp.network=dhcpwan; "
-                 "uci add_list mwan4.dhcp.probe_targets=203.0.113.1:8093; "
-                 "uci set mwan4.dhcp.weight=1; uci commit mwan4")
+        for key, value in (
+            ("global.enabled", "1"),
+            ("global.route_priority", "10"),
+            ("global.ecmp_mode", "standard"),
+            ("ppp", "interface"),
+            ("ppp.network", "pppwan"),
+            ("ppp.weight", "2"),
+            ("dhcp", "interface"),
+            ("dhcp.network", "dhcpwan"),
+            ("dhcp.weight", "1"),
+        ):
+            self.cmd(f"uci set mwan4.{key}={value}")
+        self.cmd("uci add_list mwan4.ppp.probe_targets=100.64.1.1:8093")
+        self.cmd("uci add_list mwan4.dhcp.probe_targets=203.0.113.1:8093")
+        self.cmd("uci commit mwan4")
         self.cmd("/etc/init.d/mwan4 start")
         self.wait("pidof mwan4 >/dev/null", 45)
         self.cmd("/usr/bin/mwan4 --check-config /var/etc/mwan4.json")
@@ -208,11 +214,16 @@ class Lab:
         self.cmd(". /lib/functions/network.sh; "
                  "network_get_device pppdev pppwan; grep -Fq \"$pppdev\" /var/etc/mwan4.json")
         print("PASS: PPPoE redial and dynamic L3 interface mapping", flush=True)
-        self.cmd("uci set pbr.config.enabled=1; "
-                 "uci set pbr.config.strict_enforcement=0; "
-                 "uci set pbr.mwan4_ci=policy; uci set pbr.mwan4_ci.name=CI_DHCP_WAN; "
-                 "uci set pbr.mwan4_ci.src_addr=192.0.2.0/24; "
-                 "uci set pbr.mwan4_ci.interface=dhcpwan; uci commit pbr")
+        for key, value in (
+            ("config.enabled", "1"),
+            ("config.strict_enforcement", "0"),
+            ("mwan4_ci", "policy"),
+            ("mwan4_ci.name", "CI_DHCP_WAN"),
+            ("mwan4_ci.src_addr", "192.0.2.0/24"),
+            ("mwan4_ci.interface", "dhcpwan"),
+        ):
+            self.cmd(f"uci set pbr.{key}={value}")
+        self.cmd("uci commit pbr")
         self.cmd("/etc/init.d/firewall restart", 80)
         self.cmd("/etc/init.d/pbr restart", 95)
         self.wait("ip -4 rule show | grep -q fwmark", 55)
