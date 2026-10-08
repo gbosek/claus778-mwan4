@@ -20,6 +20,8 @@ snapshot_default_routes() {
 	for family in 4 6; do
 		snap="$ROUTE_SNAPSHOT_DIR/default$family.bin"
 		[ -e "$snap" ] && continue
+		# IPv4-only OpenWrt kernels may not support any IPv6 route calls.
+		[ "$family" = 6 ] && ! ip -6 route show table main >/dev/null 2>&1 && continue
 		# A leftover mwan4 route is not an original netifd route. Refuse to
 		# snapshot it, as restoring it would recreate stale ECMP nexthops.
 		if ip "-$family" route show table main default proto 77 | grep -q .; then
@@ -43,6 +45,9 @@ snapshot_default_routes() {
 verify_default_route_metric() {
 	local managed_metric="$1" family rows
 	for family in 4 6; do
+		if [ "$family" = 6 ] && ! ip -6 route show table main >/dev/null 2>&1; then
+			continue
+		fi
 		rows="$(ip "-$family" -o route show table main default)" || return 1
 		[ -n "$rows" ] || continue
 		if printf '%s\n' "$rows" | awk -v chosen="$managed_metric" '
