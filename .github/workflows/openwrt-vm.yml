@@ -39,6 +39,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 qemu-utils iproute2 dnsmasq-base pppoe ppp python3-pexpect
+      - name: Compile Python VM harness before download
+        run: python3 -m py_compile tests/openwrt_vm.py
       - name: Download and verify official OpenWrt x86_64 ext4 disk
         run: |
           set -euo pipefail
@@ -48,7 +50,20 @@ jobs:
           printf '%s  %s\n' \
             5b854a7a2909a0b21887ba9be773b0964eb28fef81d6b8399d32a0f270a5d8ff \
             /tmp/openwrt.img.gz | sha256sum --check
-          gzip -dc /tmp/openwrt.img.gz > /tmp/openwrt.img
+          # The official combined image may have trailing non-gzip padding:
+          # GNU gzip exits 2 with a warning despite a verified SHA256 file.
+          # Require a complete zlib gzip member (eof), then ignore only tail.
+          python3 - <<'PY'
+          from pathlib import Path
+          import zlib
+          packed = Path('/tmp/openwrt.img.gz').read_bytes()
+          stream = zlib.decompressobj(wbits=31)
+          payload = stream.decompress(packed) + stream.flush()
+          assert stream.eof, 'incomplete gzip member'
+          assert len(payload) > 16 * 1024 * 1024, 'truncated OpenWrt image'
+          Path('/tmp/openwrt.img').write_bytes(payload)
+          print(f'OpenWrt image: {len(payload)} bytes; {len(stream.unused_data)} trailing padding bytes')
+          PY
       - name: Build actual Rust static binary
         uses: dtolnay/rust-toolchain@stable
         with:
