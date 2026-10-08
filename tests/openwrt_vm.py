@@ -147,8 +147,8 @@ class Lab:
         self.cmd("ifup pppwan")
         self.wait('ubus call network.interface.pppwan status | grep -q \'"up": true\'', 120)
         self.cmd(". /lib/functions/network.sh; "
-                 "network_get_device pppdev pppwan; test -n \\"$pppdev\\"; "
-                 "ip link show \\"$pppdev\\"")
+                 "network_get_device pppdev pppwan; test -n \"$pppdev\"; "
+                 "ip link show \"$pppdev\"")
         print("PASS: actual PPPoE session established using TAP link", flush=True)
         self.cmd("uci set mwan4.global.enabled=1; "
                  "uci set mwan4.global.route_priority=10; "
@@ -170,7 +170,7 @@ class Lab:
         self.wait('ubus call network.interface.pppwan status | grep -q \'"up": true\'', 110)
         self.wait("pidof mwan4 >/dev/null", 45)
         self.cmd(". /lib/functions/network.sh; "
-                 "network_get_device pppdev pppwan; grep -Fq \\"$pppdev\\" /var/etc/mwan4.json")
+                 "network_get_device pppdev pppwan; grep -Fq \"$pppdev\" /var/etc/mwan4.json")
         print("PASS: PPPoE redial and dynamic L3 interface mapping", flush=True)
         self.cmd("uci set pbr.config.enabled=1; "
                  "uci set pbr.config.strict_enforcement=0; "
@@ -183,7 +183,7 @@ class Lab:
         self.cmd("fw4 print >/tmp/mwan4-fw4.nft; test -s /tmp/mwan4-fw4.nft")
         self.cmd("nft list ruleset | grep -q pbr")
         self.cmd("/etc/init.d/mwan4 reload")
-        self.cmd("grep -E '\\"policy_skip_mark_mask\\": [1-9][0-9]*' /var/etc/mwan4.json")
+        self.cmd("grep -E 'policy_skip_mark_mask.*[1-9][0-9]*' /var/etc/mwan4.json")
         self.wait("pidof mwan4 >/dev/null", 45)
         print("PASS: real firewall4 + standalone PBR mark coexistence", flush=True)
         self.cmd("ifdown dhcpwan")
