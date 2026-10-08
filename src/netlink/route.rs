@@ -3782,6 +3782,32 @@ mod tests {
         assert_eq!(attrs[3].1, vec![10, 0, 0, 0]);
         assert_eq!(attrs[4].1, vec![PROBE_RULE_PROTOCOL]);
 
+        let pbr_rule = PolicyRule {
+            skip_mark_mask: Some(0x00ff0000),
+            ..rule.clone()
+        };
+        let msg = RouteManager::build_policy_rule_msg(
+            20,
+            &pbr_rule,
+            RTM_NEWRULE,
+            NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE,
+        );
+        let (_, masked_attrs) = parse_rule(&msg);
+        assert_eq!(
+            attr_types(&masked_attrs),
+            vec![
+                FRA_TABLE,
+                FRA_PRIORITY,
+                FRA_SRC,
+                FRA_DST,
+                FRA_FWMARK,
+                FRA_FWMASK,
+                FRA_PROTOCOL,
+            ]
+        );
+        assert_eq!(read_u32(&masked_attrs[4].1, 0), Some(0));
+        assert_eq!(read_u32(&masked_attrs[5].1, 0), Some(0x00ff0000));
+
         let any = PolicyRule {
             name: "all".to_string(),
             ifindex: 5,
