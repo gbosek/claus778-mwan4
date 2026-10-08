@@ -23,9 +23,26 @@ concurrency:
 
 jobs:
   openwrt-qemu:
-    name: OpenWrt 24.10.5 / real PPPoE, DHCP, firewall4, PBR
+    name: ${{ matrix.label }} / PPPoE, DHCP, firewall4, PBR
     runs-on: ubuntu-24.04
     timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - family: openwrt
+            label: OpenWrt-24.10.5
+            image_url: https://downloads.openwrt.org/releases/24.10.5/targets/x86/64/openwrt-24.10.5-x86-64-generic-ext4-combined.img.gz
+            image_sha256: 5b854a7a2909a0b21887ba9be773b0964eb28fef81d6b8399d32a0f270a5d8ff
+            kernel_url: https://downloads.openwrt.org/releases/24.10.5/targets/x86/64/openwrt-24.10.5-x86-64-generic-kernel.bin
+            kernel_sha256: 2453476e27bcc5716e84ece27630c3e494e3d45a4d3240d55b7c3d630d3289c8
+          - family: immortalwrt
+            label: ImmortalWrt-6.18.52
+            # Pinned 2026-09-18 snapshot; fail closed if upstream changes.
+            image_url: https://downloads.immortalwrt.org/snapshots/targets/x86/64/immortalwrt-x86-64-generic-ext4-combined.img.gz
+            image_sha256: d743c20d5380006055792221df454cb27b4b0109dd212cafd1715b1ea99f0e42
+            kernel_url: https://downloads.immortalwrt.org/snapshots/targets/x86/64/immortalwrt-x86-64-generic-kernel.bin
+            kernel_sha256: 72303e0a86495e7d0fb74d70b66cbc384b79acf810b3d84ca18079a33ee1780d
     steps:
       - uses: actions/checkout@v4
       - name: Install QEMU and virtual WAN test services
@@ -64,14 +81,14 @@ jobs:
         run: python3 -m py_compile tests/openwrt_vm.py
       - name: Verify serial shell framing regression
         run: python3 -m unittest discover -s tests -p test_openwrt_vm_serial.py -v
-      - name: Download and verify official OpenWrt x86_64 ext4 disk
+      - name: Download pinned ${{ matrix.label }} x86_64 ext4 disk
         run: |
           set -euo pipefail
           curl --fail --location --retry 4 --retry-delay 3 \
             -o /tmp/openwrt.img.gz \
-            https://downloads.openwrt.org/releases/24.10.5/targets/x86/64/openwrt-24.10.5-x86-64-generic-ext4-combined.img.gz
+            "${{ matrix.image_url }}"
           printf '%s  %s\n' \
-            5b854a7a2909a0b21887ba9be773b0964eb28fef81d6b8399d32a0f270a5d8ff \
+            "${{ matrix.image_sha256 }}" \
             /tmp/openwrt.img.gz | sha256sum --check
           # The official combined image may have trailing non-gzip padding:
           # GNU gzip exits 2 with a warning despite a verified SHA256 file.
@@ -91,9 +108,9 @@ jobs:
           # ttyS0, not VGA (which is noninteractive on headless Actions).
           curl --fail --location --retry 4 --retry-delay 3 \
             -o /tmp/openwrt-kernel.bin \
-            https://downloads.openwrt.org/releases/24.10.5/targets/x86/64/openwrt-24.10.5-x86-64-generic-kernel.bin
+            "${{ matrix.kernel_url }}"
           printf '%s  %s\n' \
-            2453476e27bcc5716e84ece27630c3e494e3d45a4d3240d55b7c3d630d3289c8 \
+            "${{ matrix.kernel_sha256 }}" \
             /tmp/openwrt-kernel.bin | sha256sum --check
       - name: Build actual Rust static binary
         uses: dtolnay/rust-toolchain@stable
@@ -108,18 +125,19 @@ jobs:
           cp openwrt/luci-app-mwan4/root/etc/init.d/mwan4 /tmp/mwan4-vm-payload/mwan4-init
           cp openwrt/luci-app-mwan4/root/etc/config/mwan4 /tmp/mwan4-vm-payload/mwan4-uci
           cp openwrt/mwan4-pbr-compat/files/usr/libexec/mwan4-pbr-compat /tmp/mwan4-vm-payload/pbr-compat
-      - name: Boot OpenWrt and execute integration regression
+      - name: Boot ${{ matrix.label }} and execute integration regression
         timeout-minutes: 22
         run: |
           python3 tests/openwrt_vm.py \
             --image /tmp/openwrt.img \
             --kernel /tmp/openwrt-kernel.bin \
+            --distro ${{ matrix.family }} \
             --payload /tmp/mwan4-vm-payload \
             --output /tmp/mwan4-vm-logs
       - name: Upload guest serial and WAN service logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: openwrt-vm-logs
+          name: openwrt-vm-logs-${{ matrix.family }}
           path: /tmp/mwan4-vm-logs
           if-no-files-found: ignore
