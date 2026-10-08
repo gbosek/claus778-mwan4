@@ -1108,12 +1108,20 @@ impl RouteManager {
         let mut first_err: Option<io::Error> = None;
         let mut removed = 0usize;
         for slot in 0..POLICY_SLOT_MAX {
-            match self.delete_own_rule_by_priority(POLICY_RULE_PRIORITY_BASE + slot) {
-                Ok(true) => removed += 1,
-                Ok(false) => {}
-                Err(e) => {
-                    if first_err.is_none() {
-                        first_err = Some(e);
+            // A single user policy expands into multiple (src,dst) combinations.
+            // Those fib rules intentionally share the same priority. Deleting
+            // once per priority leaves stale rules after an unclean shutdown.
+            // The validator caps expanded rules at POLICY_SLOT_MAX, so each
+            // priority can be drained with a bounded number of netlink calls.
+            for _ in 0..POLICY_SLOT_MAX {
+                match self.delete_own_rule_by_priority(POLICY_RULE_PRIORITY_BASE + slot) {
+                    Ok(true) => removed += 1,
+                    Ok(false) => break,
+                    Err(e) => {
+                        if first_err.is_none() {
+                            first_err = Some(e);
+                        }
+                        break;
                     }
                 }
             }
