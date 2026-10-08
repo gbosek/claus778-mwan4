@@ -25,6 +25,7 @@ def host(*args, sudo=False):
 class Lab:
     def __init__(self, args):
         self.image = pathlib.Path(args.image).resolve()
+        self.kernel = pathlib.Path(args.kernel).resolve()
         self.payload = pathlib.Path(args.payload).resolve()
         self.output = pathlib.Path(args.output).resolve()
         self.output.mkdir(parents=True, exist_ok=True)
@@ -68,6 +69,8 @@ class Lab:
             "qemu-system-x86_64", "-machine", "pc", "-accel", "tcg",
             "-m", "512", "-smp", "2", "-display", "none", "-monitor", "none",
             "-serial", "stdio", "-no-reboot",
+            "-kernel", str(self.kernel),
+            "-append", "root=/dev/vda2 rootwait rootfstype=ext4 console=ttyS0,115200n8",
             "-drive", "file=" + str(self.image) + ",if=virtio,format=raw",
             "-netdev", "user,id=mgmt",
             "-device", "virtio-net-pci,netdev=mgmt,mac=52:54:00:11:00:01",
@@ -225,6 +228,7 @@ class Lab:
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--image", required=True)
+    p.add_argument("--kernel", required=True)
     p.add_argument("--payload", required=True)
     p.add_argument("--output", required=True)
     args = p.parse_args()

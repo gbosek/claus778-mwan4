@@ -57,6 +57,14 @@ jobs:
           Path('/tmp/openwrt.img').write_bytes(payload)
           print(f'OpenWrt image: {len(payload)} bytes; {len(stream.unused_data)} trailing padding bytes')
           PY
+          # Boot the matching official kernel directly so /dev/console uses
+          # ttyS0, not VGA (which is noninteractive on headless Actions).
+          curl --fail --location --retry 4 --retry-delay 3 \
+            -o /tmp/openwrt-kernel.bin \
+            https://downloads.openwrt.org/releases/24.10.5/targets/x86/64/openwrt-24.10.5-x86-64-generic-kernel.bin
+          printf '%s  %s\n' \
+            2453476e27bcc5716e84ece27630c3e494e3d45a4d3240d55b7c3d630d3289c8 \
+            /tmp/openwrt-kernel.bin | sha256sum --check
       - name: Build actual Rust static binary
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -75,6 +83,7 @@ jobs:
         run: |
           python3 tests/openwrt_vm.py \
             --image /tmp/openwrt.img \
+            --kernel /tmp/openwrt-kernel.bin \
             --payload /tmp/mwan4-vm-payload \
             --output /tmp/mwan4-vm-logs
       - name: Upload guest serial and WAN service logs
