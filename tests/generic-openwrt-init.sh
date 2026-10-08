@@ -128,6 +128,7 @@ IP_CALLS="$TMP/ip-calls.txt"
 ip() {
     printf '%s\n' "$*" >> "$IP_CALLS"
     case "$*" in
+        "-6 route show table main" | \
         "-4 route show table main default proto 77" | \
         "-6 route show table main default proto 77") return 0 ;;
         "-4 route save table main default") printf 'ORIGINAL-IPv4'; return 0 ;;
@@ -156,6 +157,7 @@ ip() {
     case "$*" in
         "-4 -o route show table main default")
             printf 'default via 192.0.2.1 dev eth7 metric %s\n' "$MOCK_BASELINE_METRIC" ;;
+        "-6 route show table main") return 0 ;;
         "-6 -o route show table main default")
             printf 'default via 2001:db8::1 dev eth7 proto ra metric 1024\n' ;;
         *) echo "unexpected metric-check ip call: $*" >&2; return 1 ;;
