@@ -116,3 +116,23 @@ local UCI config on upgrades. Only enable after reviewing chosen WANs.
   tests on a production router.
 - The JSON status key is now `load_shifted`, not `offloaded`. It represents
   dynamic traffic shifting and does not imply hardware flow offload.
+
+## Non-destructive default route takeover (routing metric check)
+
+Before starting the daemon, OpenWrt init checks both families in the main
+routing table. If a non-mwan4 default has a metric **less than or equal**
+to `global.route_priority` (default 0), start is refused. This protects
+existing netifd defaults against same-metric replacement and guarantees
+that a higher-priority ECMP route will actually be used.
+
+Configure the original WAN interfaces in `/etc/config/network` to have
+metrics larger than the chosen mwan4 default (e.g. netifd 100/200,
+mwan4 10); this must be an explicit user decision, never an installer side
+effect. A disabled/unconfigured installation does not inspect or alter any
+default routes.
+
+On stop or reload, owned proto-77 default routes are removed first. If a
+fresh netifd default remains present, the saved route is discarded rather
+than replaying a stale PPPoE/DHCP gateway. The save/restore binary is
+an emergency fallback **only** when no current default exists. Gateway
+churn and no-default emergency recovery still require real-device tests.

@@ -36,6 +36,32 @@ snapshot_default_routes() {
 	done
 }
 
+# Fail safe if the new ECMP default metric collides with or ranks below
+# a netifd default. We never replace a same-metric route owned by the OS,
+# and a worse metric would leave mwan4 ineffectual while reporting "up".
+# An IPv6 default is often metric 1024; the same rule applies per family.
+verify_default_route_metric() {
+	local managed_metric="$1" family rows
+	for family in 4 6; do
+		rows="$(ip "-$family" -o route show table main default)" || return 1
+		[ -n "$rows" ] || continue
+		if printf '%s\n' "$rows" | awk -v chosen="$managed_metric" '
+		{
+			metric=0; owned=0;
+			for (i=1; i<=NF; i++) {
+				if ($i=="metric" && i<NF) metric=$(i+1);
+				if ($i=="proto" && i<NF && ($(i+1)=="77" || $(i+1)=="mwan4")) owned=1;
+			}
+			if (!owned && metric <= chosen) { print; failure=1; }
+		}
+		END { exit failure?0:1 }'; then
+			logger -t mwan4 "IPv$family default route metric conflicts with mwan4 metric $managed_metric: configure existing WAN default route metrics higher, leaving networking untouched"
+			return 1
+		fi
+	done
+	return 0
+}
+
 # Called by rc.common after procd_kill has stopped the daemon.
 # Only touch default routes identified as mwan4 proto-77. Do not flush
 # main-table LAN routes, PBR tables, IP rules, or conntrack on service stop.
@@ -52,13 +78,20 @@ restore_default_routes() {
 			rm -f "$snap"
 			continue
 		fi
-		# remove_routes_on_exit may already have cleaned it up.
-		if ip "-$family" route flush table main default proto 77 && \
-		   ip "-$family" route restore < "$snap"; then
-			logger -t mwan4 "Restored IPv$family main-table default route snapshot"
+		# Remove ONLY the managed route. netifd remains authoritative:
+		# prefer a CURRENT default over a stale saved PPPoE/DHCP gateway.
+		if ! ip "-$family" route flush table main default proto 77; then
+			logger -t mwan4 "Failed to remove owned IPv$family default route; snapshot retained"
+			continue
+		fi
+		if ip "-$family" route show table main default | grep -q .; then
+			logger -t mwan4 "IPv$family current netifd default exists; discarding obsolete route snapshot"
+			rm -f "$snap"
+		elif ip "-$family" route restore < "$snap"; then
+			logger -t mwan4 "Restored saved IPv$family default route as emergency fallback"
 			rm -f "$snap"
 		else
-			logger -t mwan4 "IPv$family route restore failed; snapshot retained at $snap"
+			logger -t mwan4 "IPv$family restore failed, likely stale gateway; snapshot retained"
 		fi
 	done
 	rmdir "$ROUTE_SNAPSHOT_DIR" 2>/dev/null || :
@@ -112,7 +145,7 @@ is_decimal() {
 generate_json_config() {
 	mkdir -p "$CONF_DIR"
 
-	local enabled check_interval probe_timeout window_size loss_down degrade_loss degrade_hysteresis degrade_exit degrade_enter degrade_min_out fail_down recovery max_rtt flush_ct flush_switch ecmp_mode remove_routes dyn_standard_ok
+	local enabled check_interval probe_timeout window_size loss_down degrade_loss degrade_hysteresis degrade_exit degrade_enter degrade_min_out fail_down recovery max_rtt flush_ct flush_switch ecmp_mode remove_routes dyn_standard_ok route_priority
 	# 未设定即视为启用（与 LuCI 预设一致，也让忘记写 enabled 不会静默不启动）
 	config_get_bool enabled global enabled 0
 	[ "$enabled" -eq 1 ] || return 1
@@ -136,6 +169,11 @@ generate_json_config() {
 	# 成员进出时是否清 conntrack（仅 standard ECMP 生效；主备模式下只清新进成员）
 	config_get_bool flush_switch global flush_conntrack_on_switch 1
 	config_get ecmp_mode global ecmp_mode auto
+	config_get route_priority global route_priority 0
+	if ! is_uint "$route_priority"; then
+		logger -t mwan4 "Invalid global route_priority: $route_priority"
+		return 1
+	fi
 	# 退出时是否删预设路由。预设 0：删掉唯一预设路由会在重启窗口内让路由器失去出口，且启动失败时无法自行恢复
 	config_get_bool remove_routes global remove_routes_on_exit 0
 
@@ -351,6 +389,7 @@ generate_json_config() {
 	  "recovery_success_count": $recovery,
 	  "max_rtt_ms": $max_rtt,
 	  "ecmp_mode": "$ecmp_mode_json",
+	  "route_priority": $route_priority,
 	  "multipath_hash_policy": $hash_policy_json,
 	  "weight_mode": "$weight_mode_json",
 	  "dynamic_weight_interval_ms": $dyn_interval,
@@ -594,6 +633,12 @@ start_service() {
 	# Validate before taking a route snapshot or starting the daemon.
 	if ! "$PROG" --check-config "$CONF_FILE"; then
 		logger -t mwan4 "Generated config $CONF_FILE failed --check-config, aborting start"
+		return 1
+	fi
+	# Do not hijack netifd's existing lower/equal-metric default routes.
+	local configured_metric
+	config_get configured_metric global route_priority 0
+	if ! verify_default_route_metric "$configured_metric"; then
 		return 1
 	fi
 	# iproute2 is required here; a failed snapshot must never silently

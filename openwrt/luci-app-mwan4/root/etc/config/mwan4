@@ -1,5 +1,8 @@
 config global 'global'
 	option enabled '0'
+	# Must be strictly lower than the metrics of netifd-installed default
+	# routes on participating WANs; start is refused on conflicts.
+	option route_priority '0'
 	option check_interval_ms '500'
 	option probe_timeout_ms '400'
 	option window_size '10'
