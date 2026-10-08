@@ -384,7 +384,18 @@ class Lab:
         if pbr_mark is None:
             raise AssertionError(f"no dhcpwan PBR fwmark rule found:\\n{rules}")
         self.cmd("ip -4 rule show | grep -q 'from 192.0.2.0/24'")
-        self.cmd("ip -4 rule show | grep -q 'fwmark 0x0/'")
+        try:
+            self.cmd(
+                "ip -4 rule show | grep -Eq 'fwmark 0x0(/|[[:space:]]|$)|not fwmark'"
+            )
+        except (AssertionError, pexpect.TIMEOUT, pexpect.EOF):
+            for command in (
+                "ip -4 rule show",
+                "ip -4 route show table all",
+                "nft list ruleset",
+            ):
+                self.cmd(f"{command} || true")
+            raise
         marked = self.cmd(
             f"ip -4 route get 198.18.0.1 from 192.0.2.10 mark {pbr_mark}"
         )
