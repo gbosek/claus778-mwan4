@@ -745,7 +745,10 @@ fn netns_policy_routing() {
         "ip", "rule", "add", "pref", "30000",
         "fwmark", "0x10000/0xff0000", "lookup", "201",
     ]));
-    let masked = PolicyRule { skip_mark_mask: Some(0x00ff0000), ..rule.clone() };
+    let masked = PolicyRule {
+        skip_mark_mask: Some(0x00ff0000),
+        ..rule.clone()
+    };
     rm.set_policy_rules(&[masked]).expect("enable PBR mark exemption");
     let pbr_hit = sh_out(&[
         "ip", "route", "get", "8.8.8.8", "from", "192.168.9.5",
