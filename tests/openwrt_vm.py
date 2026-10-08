@@ -183,6 +183,9 @@ class Lab:
             ("dhcpwan.device", "eth2"),
             ("dhcpwan.proto", "dhcp"),
             ("dhcpwan.metric", "200"),
+            # The TAP gateway 203.0.113.1 is isolated and has NO Internet.
+            # Keep it from stealing the default route during package setup.
+            ("dhcpwan.defaultroute", "0"),
             ("pppwan", "interface"),
             ("pppwan.device", "eth1"),
             ("pppwan.proto", "pppoe"),
@@ -199,12 +202,26 @@ class Lab:
         self.wait('ubus call network.interface.mgmt status | grep -q \'"up": true\'')
         self.phase = "management IP and package installation"
         self.cmd("ping -c 1 -W 3 10.0.2.2 >/dev/null")
+        # Earlier builds sent downloads via the isolated DHCP TAP (metric
+        # 200 < mgmt 300), which cannot reach Internet package feeds.
+        self.cmd("ip route show default | grep -q '10.0.2.2'")
+        self.cmd("uci -q get network.dhcpwan.defaultroute | grep -qx 0")
+        self.checkpoint("PASS: management default route preserved for feeds")
+        self.cmd("nslookup downloads.openwrt.org >/tmp/mwan4-dns.log 2>&1",
+                 timeout=35)
         # Genuine distro PBR/firewall4 package, not mock nft rule sets.
-        self.cmd("opkg update >/tmp/opkg-update.log 2>&1 || "
-                 "{ tail -n 30 /tmp/opkg-update.log; false; }", timeout=180)
-        self.cmd("opkg install ppp ppp-mod-pppoe ip-full nftables-json pbr "
-                 ">/tmp/opkg-install.log 2>&1 || "
-                 "{ tail -n 60 /tmp/opkg-install.log; false; }", timeout=200)
+        # Each attempt is bounded; the real guest log is reported on failure.
+        try:
+            self.cmd("timeout 90 opkg update >/tmp/mwan4-opkg-update.log 2>&1",
+                     timeout=110)
+        except (AssertionError, pexpect.TIMEOUT):
+            self.cmd("tail -n 45 /tmp/mwan4-opkg-update.log")
+            self.cmd("ip route show default")
+            self.cmd("cat /tmp/mwan4-dns.log")
+            raise
+        self.cmd("timeout 110 opkg install ppp ppp-mod-pppoe ip-full nftables-json pbr >/tmp/mwan4-opkg-install.log 2>&1",
+                 timeout=130)
+        self.checkpoint("PASS: actual OpenWrt package feeds and PBR packages")
         self.cmd("mkdir -p /usr/libexec /etc/config; "
                  "wget -qO /usr/bin/mwan4 http://10.0.2.2:8093/mwan4; "
                  "chmod 755 /usr/bin/mwan4")
@@ -213,6 +230,13 @@ class Lab:
         self.cmd("wget -qO /etc/config/mwan4 http://10.0.2.2:8093/mwan4-uci")
         self.cmd("wget -qO /usr/libexec/mwan4-pbr-compat "
                  "http://10.0.2.2:8093/pbr-compat; chmod 755 /usr/libexec/mwan4-pbr-compat")
+        # Switch the isolated DHCP WAN's default route back on after
+        # package and payload installation, for real netifd/PBR testing.
+        self.cmd("uci set network.dhcpwan.defaultroute=1")
+        self.cmd("uci commit network")
+        self.cmd("(/etc/init.d/network reload >/tmp/mwan4-wan-reload.log 2>&1) &")
+        self.wait("ubus call network.interface.dhcpwan status | grep -q '\"up\": true'", 70)
+        self.checkpoint("PASS: isolated DHCP WAN routing enabled after feeds")
         self.cmd('test "$(uci -q get mwan4.global.enabled)" = 0; '
                  '! grep -q "^config interface " /etc/config/mwan4; '
                  '! ip -4 route show table main default proto 77 | grep -q .')
