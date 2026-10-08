@@ -434,7 +434,7 @@ class Lab:
             marked = self.cmd(
                 f"ip -4 route get 198.18.0.1 from 192.0.2.10 mark {pbr_mark}"
             )
-            if not re.search(r"\bdev eth2\b", marked):
+            if not re.search(r"\bdev\s+eth2\b", marked):
                 raise AssertionError(
                     f"marked PBR traffic did not select dhcpwan: {marked}"
                 )
@@ -445,7 +445,7 @@ class Lab:
             unmarked = self.cmd(
                 "ip -4 route get 198.18.0.1 from 192.0.2.10"
             )
-            if not re.search(r"\bdev ppp[^\s]*\b", unmarked):
+            if not re.search(r"\bdev\s+ppp[^\s]*\b", unmarked):
                 raise AssertionError(
                     "unmarked traffic did not retain PPPoE native policy: "
                     f"{unmarked}"
