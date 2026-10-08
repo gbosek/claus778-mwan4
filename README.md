@@ -1,5 +1,19 @@
 # MWAN4 (Multi-WAN 4)
 
+> **Development fork — do not install on a production router yet.**
+>
+> This branch defaults to disabled mwan4 with no preconfigured WAN interfaces.
+> Earlier upstream examples below (including `wan1/wan2`, offline
+> `dist/install.sh`, and manual service enable commands) are reference
+> examples, **not safe first-install instructions for this fork**.
+> `dist/install.sh` checked into this repository is intentionally disabled.
+> See [source audit](docs/REVIEW_2026-10-08.md) and
+> [generic OpenWrt integration](docs/GENERIC_OPENWRT.md).
+>
+> **Hardware offload compatibility is not guaranteed by ECMP**; check the
+> actual driver/PPE/NPU flow counters before claiming hardware acceleration.
+
+
 专为 Linux / OpenWrt 深度设计的极轻量、零负担、高性能「多 WAN 故障转移与健康监控守护进程（Daemon）」。
 
 用以彻底替代架构笨重、频繁呼叫 Shell 脚本、吃 CPU 且严重破坏硬体加速（Flow Offload）的传统 `mwan3`。
