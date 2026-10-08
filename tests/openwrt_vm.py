@@ -299,6 +299,10 @@ class Lab:
                  "network_get_device pppdev pppwan; test -n \"$pppdev\"; "
                  "ip link show \"$pppdev\"")
         self.checkpoint("PASS: actual PPPoE session established using TAP link")
+        # `ip route get ... from` rejects an arbitrary unassigned source.
+        # Give the synthetic PBR client address to loopback so the local
+        # route lookup can exercise the overlapping source-policy rules.
+        self.cmd("ip -4 address add 192.0.2.10/32 dev lo")
         for key, value in (
             ("global.enabled", "1"),
             ("global.route_priority", "10"),
