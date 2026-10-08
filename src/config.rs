@@ -1230,6 +1230,17 @@ mod tests {
     }
 
     #[test]
+    fn test_policy_skip_mark_mask_validation() {
+        let mut cfg = DaemonConfig::default();
+        cfg.policy_skip_mark_mask = Some(0x00ff0000);
+        assert!(cfg.validate().is_ok());
+        cfg.policy_skip_mark_mask = Some(0);
+        assert!(cfg.validate().is_err());
+        cfg.policy_skip_mark_mask = None;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
     fn test_policies_validation() {
         let base = r#""interfaces":[{"name":"wan1"},{"name":"wan2"}]"#;
         let ok: DaemonConfig = serde_json::from_str(&format!(
