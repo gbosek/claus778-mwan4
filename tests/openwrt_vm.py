@@ -79,8 +79,15 @@ class Lab:
         self.guest = pexpect.spawn(command[0], command[1:],
                                    encoding="utf-8", timeout=120, echo=False)
         self.guest.logfile = self.serial
-        self.guest.expect([r"Press Enter to activate this console",
-                           r"root@OpenWrt:[^\r\n]*#\s*"], timeout=145)
+        # Official OpenWrt x86 actually says:
+        # "Please press Enter to activate this console." (confirmed in
+        # guest-serial.log from CI run 37748951378).
+        # The old regex missed the lowercase "press" and "Please" prefix.
+        self.guest.expect([
+            r"Please press Enter to activate this console\.",
+            r"Press Enter to activate this console",
+            r"root@OpenWrt:[^\r\n]*#\s*",
+        ], timeout=145)
         self.guest.sendline("")
         self.guest.expect(r"root@OpenWrt:[^\r\n]*#\s*", timeout=35)
         self.cmd("cat /etc/openwrt_release; ip -br link; uci show network")

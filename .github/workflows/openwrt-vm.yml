@@ -1,15 +1,8 @@
 name: OpenWrt QEMU integration
 
+# VM tests run ONCE per pull request instead of twice on feature pushes
+# plus pull_request events. Manual dispatch remains available.
 on:
-  push:
-    branches: ['feature/**']
-    paths:
-      - 'src/**'
-      - 'openwrt/**'
-      - 'tests/openwrt_vm.py'
-      - '.github/workflows/openwrt-vm.yml'
-      - 'Cargo.lock'
-      - 'Cargo.toml'
   pull_request:
     branches: [master]
     paths:
