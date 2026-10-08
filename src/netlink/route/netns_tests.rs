@@ -752,13 +752,25 @@ fn netns_policy_routing() {
         "策略规则未被移除:\n{rules}"
     );
 
-    // sweep 也要能清掉残留（模拟上次执行留下的规则）
-    rm.set_policy_rules(&[rule]).expect("reinstall policy rule");
-    rm.sweep_policy_rules().expect("sweep policy rules");
+    // One policy can expand into several rules with the SAME priority.
+    // A crash/restart must drain every matching rule, not merely the first.
+    let additional_rule = PolicyRule {
+        name: "guest-second-source".to_string(),
+        ifindex: ifindex("mwp1"),
+        table: PROBE_TABLE_BASE + 1,
+        priority: POLICY_RULE_PRIORITY_BASE,
+        source: Some(("192.168.8.0".parse().unwrap(), 24)),
+        destination: None,
+    };
+    rm.set_policy_rules(&[rule, additional_rule])
+        .expect("install two rules on the same priority");
+    let rules = sh_out(&["ip", "rule", "show"]);
+    assert!(rules.contains("192.168.9.0/24") && rules.contains("192.168.8.0/24"));
+    rm.sweep_policy_rules().expect("sweep every expanded rule");
     let rules = sh_out(&["ip", "rule", "show"]);
     assert!(
-        !rules.contains("192.168.9.0/24"),
-        "sweep 未清掉策略规则:\n{rules}"
+        !rules.contains("192.168.9.0/24") && !rules.contains("192.168.8.0/24"),
+        "sweep left behind same-priority policy rule(s):\n{rules}"
     );
 
     // FIX-8：auto 模式必须回报「实际安装生效的变体」，主回圈才能正确决定
