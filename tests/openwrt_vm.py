@@ -101,6 +101,11 @@ class Lab:
                  "uci -q show network || true")
 
     def cmd(self, command, timeout=80):
+        # Interactive ash/ttyS0 input is line-buffered; long commands were
+        # truncated mid-UCI statement in CI #37750574184. Fail immediately
+        # instead of silently corrupting the network configuration.
+        if len(command) > 170:
+            raise ValueError(f"serial command too long ({len(command)} chars): {command[:100]}")
         self.counter += 1
         marker = f"__MWAN4_RC_{self.counter}_"
         print("GUEST:", command, flush=True)
@@ -126,18 +131,34 @@ class Lab:
 
     def tests(self):
         # Management interface is QEMU user-net, never a production interface.
-        self.cmd(
-            "uci -q delete network.lan; uci -q delete network.wan; "
-            "uci -q delete network.wan6; uci -q delete network.@device[0]; "
-            "uci set network.mgmt=interface; uci set network.mgmt.device=eth0; "
-            "uci set network.mgmt.proto=dhcp; uci set network.mgmt.metric=300; "
-            "uci set network.dhcpwan=interface; uci set network.dhcpwan.device=eth2; "
-            "uci set network.dhcpwan.proto=dhcp; uci set network.dhcpwan.metric=200; "
-            "uci set network.pppwan=interface; uci set network.pppwan.device=eth1; "
-            "uci set network.pppwan.proto=pppoe; uci set network.pppwan.username=test; "
-            "uci set network.pppwan.password=test; uci set network.pppwan.metric=100; "
-            "uci set network.pppwan.auto=0; uci commit network; /etc/init.d/network restart",
-            timeout=80)
+        self.wait("pidof netifd >/dev/null", 60)
+        # Each UCI command is short enough to survive the BusyBox serial
+        # line discipline even while kernel logs are being printed.
+        for section in ("lan", "wan", "wan6"):
+            self.cmd(f"uci -q delete network.{section} || true")
+        self.cmd("uci -q delete network.@device[0] || true")
+        for key, value in (
+            ("mgmt", "interface"),
+            ("mgmt.device", "eth0"),
+            ("mgmt.proto", "dhcp"),
+            ("mgmt.metric", "300"),
+            ("dhcpwan", "interface"),
+            ("dhcpwan.device", "eth2"),
+            ("dhcpwan.proto", "dhcp"),
+            ("dhcpwan.metric", "200"),
+            ("pppwan", "interface"),
+            ("pppwan.device", "eth1"),
+            ("pppwan.proto", "pppoe"),
+            ("pppwan.username", "test"),
+            ("pppwan.password", "test"),
+            ("pppwan.metric", "100"),
+            ("pppwan.auto", "0"),
+        ):
+            self.cmd(f"uci set network.{key}={value}")
+        self.cmd("uci commit network")
+        # netifd reload is asynchronous to avoid stopping the serial shell
+        # before its command result marker is printed.
+        self.cmd("(/etc/init.d/network reload >/tmp/mwan4-network-reload.log 2>&1) &")
         self.wait('ubus call network.interface.mgmt status | grep -q \'"up": true\'')
         self.cmd("ping -c 1 -W 3 10.0.2.2 >/dev/null")
         # Genuine distro PBR/firewall4 package, not mock nft rule sets.
