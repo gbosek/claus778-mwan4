@@ -150,9 +150,9 @@ grep -q -- '^-4 route restore$' "$IP_CALLS"
 # rc.common must stop old daemon and restore before starting new routing.
 basescript="/etc/init.d/mwan4"
 MOCK_ORDER=""
-procd_kill() { MOCK_ORDER="\${MOCK_ORDER}kill:$1 "; }
-restore_default_routes() { MOCK_ORDER="\${MOCK_ORDER}restore "; }
-rc_procd() { MOCK_ORDER="\${MOCK_ORDER}start:$1"; }
+procd_kill() { MOCK_ORDER="${MOCK_ORDER}kill:$1 "; }
+restore_default_routes() { MOCK_ORDER="${MOCK_ORDER}restore "; }
+rc_procd() { MOCK_ORDER="${MOCK_ORDER}start:$1"; }
 reload_service
 [ "$MOCK_ORDER" = "kill:mwan4 restore start:start_service" ] || {
     echo "unexpected reload order: $MOCK_ORDER" >&2
