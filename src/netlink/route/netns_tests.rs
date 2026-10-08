@@ -740,23 +740,45 @@ fn netns_policy_routing() {
     );
 
     // Simulate standalone PBR at 30000, after native policy priority 9000.
-    assert!(sh(&["ip", "route", "add", "default", "dev", "mwp0", "table", "201"]));
     assert!(sh(&[
-        "ip", "rule", "add", "pref", "30000",
-        "fwmark", "0x10000/0xff0000", "lookup", "201",
+        "ip", "route", "add", "default", "dev", "mwp0", "table", "201"
+    ]));
+    assert!(sh(&[
+        "ip",
+        "rule",
+        "add",
+        "pref",
+        "30000",
+        "fwmark",
+        "0x10000/0xff0000",
+        "lookup",
+        "201",
     ]));
     let masked = PolicyRule {
         skip_mark_mask: Some(0x00ff0000),
         ..rule.clone()
     };
-    rm.set_policy_rules(&[masked]).expect("enable PBR mark exemption");
+    rm.set_policy_rules(&[masked])
+        .expect("enable PBR mark exemption");
     let pbr_hit = sh_out(&[
-        "ip", "route", "get", "8.8.8.8", "from", "192.168.9.5",
-        "mark", "0x10000",
+        "ip",
+        "route",
+        "get",
+        "8.8.8.8",
+        "from",
+        "192.168.9.5",
+        "mark",
+        "0x10000",
     ]);
-    assert!(pbr_hit.contains("dev mwp0"), "PBR mark did not win: {pbr_hit}");
+    assert!(
+        pbr_hit.contains("dev mwp0"),
+        "PBR mark did not win: {pbr_hit}"
+    );
     let native_hit = sh_out(&["ip", "route", "get", "8.8.8.8", "from", "192.168.9.5"]);
-    assert!(native_hit.contains("dev mwp1"), "Unmarked native policy failed: {native_hit}");
+    assert!(
+        native_hit.contains("dev mwp1"),
+        "Unmarked native policy failed: {native_hit}"
+    );
     rm.set_policy_rules(std::slice::from_ref(&rule))
         .expect("restore legacy native policy");
     assert!(sh(&["ip", "rule", "del", "pref", "30000"]));
