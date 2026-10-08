@@ -68,6 +68,19 @@ service_stopped() {
 	restore_default_routes
 }
 
+# rc.common's default procd reload calls start_service() directly; it does
+# NOT call service_stopped(). With changing PPPoE netdevs that may leave
+# a stale proto-77 route if the new configuration has zero active WANs.
+# The lock is already held by rc.common's reload() wrapper. Do not call
+# /etc/init.d/mwan4 stop/restart here (that would recurse on procd_lock).
+reload_service() {
+	local base="${basescript:-$initscript}" daemon
+	daemon="${base##*/}"
+	procd_kill "$daemon"
+	service_stopped
+	rc_procd start_service
+}
+
 
 # UCI 值直接拼进 JSON，有写入权限者（rpcd ACL 开放）可用引号/反斜线/换行注入栏位，故字串一律转义、数字一律先验证
 json_escape() {
