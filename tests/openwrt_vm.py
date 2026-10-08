@@ -250,7 +250,26 @@ class Lab:
         self.cmd("(/etc/init.d/network reload >/tmp/mwan4-network-reload.log 2>&1) &")
         self.wait('ubus call network.interface.mgmt status | grep -q \'"up": true\'')
         self.phase = "management IP and package installation"
-        self.cmd("ping -c 1 -W 3 10.0.2.2 >/dev/null")
+        try:
+            # netifd can report the interface up before DHCP has installed
+            # its address and default route, especially on ImmortalWrt.
+            self.wait("ip -4 address show dev eth0 | grep -q 'inet 10.0.2.'", 60)
+            self.wait("ip -4 route show default | grep -q '10.0.2.2'", 60)
+            self.cmd("ping -c 1 -W 3 10.0.2.2 >/dev/null")
+        except (AssertionError, pexpect.TIMEOUT):
+            # Preserve enough guest state to distinguish DHCP timing from a
+            # broken QEMU management link on the next CI run.
+            try:
+                self.cmd(
+                    "ip link show eth0; ip -4 address show dev eth0; "
+                    "ip -4 route show table all; "
+                    "ubus call network.interface.mgmt status || true; "
+                    "cat /tmp/mwan4-network-reload.log 2>/dev/null || true; "
+                    "logread | grep -iE 'netifd|udhc|mgmt' | tail -n 40 || true"
+                )
+            except (AssertionError, pexpect.TIMEOUT):
+                pass
+            raise
         # Earlier builds sent downloads via the isolated DHCP TAP (metric
         # 200 < mgmt 300), which cannot reach Internet package feeds.
         self.cmd("ip route show default | grep -q '10.0.2.2'")
