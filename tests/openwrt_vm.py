@@ -85,14 +85,15 @@ class Lab:
         # Official OpenWrt x86 actually says:
         # "Please press Enter to activate this console." (confirmed in
         # guest-serial.log from CI run 37748951378).
-        # The old regex missed the lowercase "press" and "Please" prefix.
+        # The original regex missed the lowercase "press" and "Please" prefix.
+        # The shell prompt may be root@(none):~# before netifd assigns a hostname.
         self.guest.expect([
             r"Please press Enter to activate this console\.",
             r"Press Enter to activate this console",
-            r"root@OpenWrt:[^\r\n]*#\s*",
+            r"root@[^:\r\n]+:[^\r\n]*#\s*",
         ], timeout=145)
         self.guest.sendline("")
-        self.guest.expect(r"root@OpenWrt:[^\r\n]*#\s*", timeout=35)
+        self.guest.expect(r"root@[^:\r\n]+:[^\r\n]*#\s*", timeout=35)
         self.cmd("cat /etc/openwrt_release; ip -br link; uci show network")
 
     def cmd(self, command, timeout=80):
@@ -103,7 +104,7 @@ class Lab:
         self.guest.expect(re.escape(marker) + r"(\d+)", timeout=timeout)
         result = self.guest.match.group(1)
         output = self.guest.before
-        self.guest.expect(r"root@OpenWrt:[^\r\n]*#\s*", timeout=15)
+        self.guest.expect(r"root@[^:\r\n]+:[^\r\n]*#\s*", timeout=15)
         if result != "0":
             raise AssertionError(f"guest rc={result}: {command}\n{output[-2500:]}")
         return output
