@@ -22,6 +22,23 @@ def host(*args, sudo=False):
     return subprocess.run(cmd, check=True, capture_output=True, text=True)
 
 
+def serial_command_line(command, marker):
+    """Render one BusyBox ash command plus its exit-status sentinel.
+
+    A job sent to the background ends with '&', which is already a shell
+    list separator: adding ';' produces invalid '&;' (CI #37753230505).
+    """
+    command = command.rstrip()
+    if not command:
+        raise ValueError("empty serial command")
+    separator = " " if command.endswith(("&", ";")) else "; "
+    line = command + separator + f'rc=$?; printf "\\n{marker}%s\\n" "$rc"'
+    # The physical tty input has a finite canonical-mode line buffer.
+    if len(command) > 170 or len(line) > 220:
+        raise ValueError(f"serial command too long ({len(line)} chars)")
+    return line
+
+
 class Lab:
     def __init__(self, args):
         self.image = pathlib.Path(args.image).resolve()
@@ -120,16 +137,12 @@ class Lab:
                  "uci -q show network || true")
 
     def cmd(self, command, timeout=80):
-        # Interactive ash/ttyS0 input is line-buffered; long commands were
-        # truncated mid-UCI statement in CI #37750574184. Fail immediately
-        # instead of silently corrupting the network configuration.
-        if len(command) > 170:
-            raise ValueError(f"serial command too long ({len(command)} chars): {command[:100]}")
         self.counter += 1
         marker = f"__MWAN4_RC_{self.counter}_"
+        line = serial_command_line(command, marker)
         print("GUEST:", command, flush=True)
         try:
-            self.guest.sendline(command + f'; rc=$?; printf "\\n{marker}%s\\n" "$rc"')
+            self.guest.sendline(line)
             self.guest.expect(re.escape(marker) + r"(\d+)", timeout=timeout)
             result = self.guest.match.group(1)
             output = self.guest.before
