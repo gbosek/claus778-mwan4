@@ -14,7 +14,10 @@ MOCK_NAME=""
 MOCK_GATEWAY=""
 MOCK_L3=""
 MOCK_NETGW=""
+MOCK_NETGW6=""
+MOCK_NETWORK6=""
 MOCK_POLICY=0
+MOCK_UP=1
 logger() { :; }
 config_get_bool() {
     local out="$1" section="$2" key="$3" val="$4"
@@ -28,6 +31,8 @@ config_get() {
             network) val="$MOCK_NETWORK" ;;
             name) val="$MOCK_NAME" ;;
             gateway) val="$MOCK_GATEWAY" ;;
+            network6) val="$MOCK_NETWORK6" ;;
+            gateway6) val="" ;;
             enabled) val=1 ;;
         esac
     fi
@@ -58,6 +63,12 @@ network_get_gateway() {
     local out="$1" val="$MOCK_NETGW"
     eval "$out=\$val"
 }
+network_get_gateway6() {
+    [ -n "$MOCK_NETGW6" ] || return 1
+    local out="$1" val="$MOCK_NETGW6"
+    eval "$out=\$val"
+}
+network_is_up() { [ "$MOCK_UP" = 1 ]; }
 assert_empty() {
     [ ! -e "$CONF_FILE" ] || { echo "unexpected config file" >&2; exit 1; }
 }
@@ -83,6 +94,7 @@ PY
 MOCK_NETWORK="wan"
 MOCK_L3="pppoe-wan"
 MOCK_NETGW="198.51.100.1"
+MOCK_NETGW6="fe80::1"
 MOCK_POLICY=1
 generate_json_config
 python3 - "$CONF_FILE" <<'PY'
@@ -90,6 +102,7 @@ import json, sys
 d = json.load(open(sys.argv[1]))
 assert d["interfaces"][0]["name"] == "pppoe-wan"
 assert d["interfaces"][0]["gateway"] == "198.51.100.1"
+assert d["interfaces"][0]["gateway6"] == "fe80::1"
 assert d["policies"][0]["interface"] == "pppoe-wan"
 PY
 # PPPoE has no default gateway, and the device still works.
@@ -104,4 +117,8 @@ PY
 MOCK_L3=""
 generate_json_config && exit 1 || :
 assert_empty
-echo "PASS: disabled, empty, manual, dynamic PPPoE and policy mapping"
+MOCK_L3="pppoe-wan"
+MOCK_UP=0
+generate_json_config && exit 1 || :
+assert_empty
+echo "PASS: disabled, empty, manual WAN, netifd IPv4/IPv6, PPPoE policy, down state"

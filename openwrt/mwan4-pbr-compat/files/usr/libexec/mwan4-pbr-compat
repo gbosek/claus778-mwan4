@@ -1,0 +1,65 @@
+#!/bin/sh
+# Optional, read-only PBR compatibility/diagnostics for Rust ECMP mwan4.
+# Does not install or rewrite ip/nft rules and never enables PBR automatically.
+set -u
+say() { printf '%s\n' "$*"; }
+warn() { printf 'WARN: %s\n' "$*" >&2; }
+has_service() { [ -x /etc/init.d/pbr ] && [ -f /etc/config/pbr ]; }
+pbr_value() { uci -q get "pbr.config.$1" 2>/dev/null || :; }
+check() {
+	local failed=0 strict nstrict
+	if ! has_service; then
+		say "PBR is not installed; ECMP operates independently."
+		return 0
+	fi
+	say "PBR is installed; use its standalone OpenWrt routing mode."
+	if [ "$(pbr_value enabled)" != "1" ]; then
+		say "PBR is disabled. Unmatched traffic uses ECMP."
+		return 0
+	fi
+	if ! command -v nft >/dev/null 2>&1 || ! command -v ip >/dev/null 2>&1; then
+		warn "nft and ip-full are required for PBR route verification"
+		failed=1
+	fi
+	# mossdef-specific synthetic targets require ucode strategy chains,
+	# which do not exist in claus778's Rust/FIB backend.
+	if uci -q show pbr 2>/dev/null | grep -Eq "mwan4_strategy_|mwan4:strategy:"; then
+		warn "mossdef-specific PBR strategy target detected; choose ordinary WAN interfaces instead"
+		failed=1
+	fi
+	strict="$(pbr_value strict_enforcement)"
+	nstrict="$(pbr_value netifd_strict_enforcement)"
+	if [ "$strict" = "1" ]; then
+		warn "PBR strict enforcement can disable forwarding when its policies fail; review before production use"
+	fi
+	if [ "$nstrict" = "1" ]; then
+		warn "PBR netifd strict enforcement can alter default routing; verify it does not override ECMP"
+	fi
+	if [ "$failed" = 0 ]; then
+		say "Basic check passed: standalone PBR may mark selected flows; other flows remain on FIB/ECMP."
+	else
+		warn "PBR compatibility check found blocking problems."
+	fi
+	return "$failed"
+}
+status() {
+	check || return 1
+	if has_service; then
+		if /etc/init.d/pbr running >/dev/null 2>&1; then
+			say "PBR service: running"
+		else
+			say "PBR service: not running"
+		fi
+	fi
+	if command -v ip >/dev/null 2>&1; then
+		say "--- IPv4 fwmark rules ---"
+		ip -4 rule show 2>/dev/null | grep 'fwmark' || :
+		say "--- IPv6 fwmark rules ---"
+		ip -6 rule show 2>/dev/null | grep 'fwmark' || :
+	fi
+}
+case "${1:-check}" in
+	check) check ;;
+	status) status ;;
+	*) say "usage: mwan4-pbr-compat [check|status]" >&2; exit 2 ;;
+esac

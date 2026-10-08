@@ -27,6 +27,17 @@ jobs:
         run: node --check openwrt/luci-app-mwan4/htdocs/luci-static/resources/view/mwan4/overview.js
       - name: No-WAN and dynamic PPPoE regression tests
         run: sh tests/generic-openwrt-init.sh
+      - name: PBR compatibility helper syntax
+        run: sh -n openwrt/mwan4-pbr-compat/files/usr/libexec/mwan4-pbr-compat
+      - name: Ensure no installer auto-starts mwan4
+        run: |
+          python - <<'PY'
+          import pathlib
+          script = pathlib.Path("scripts/build_packages.py").read_text()
+          assert '"/etc/init.d/mwan4 enable' not in script
+          assert '"/etc/init.d/mwan4 restart' not in script
+          assert 'build_mwan4_data_entries(bin_data, init_data, uci_config_data, json_config_data)' not in script
+          PY
       - name: No preconfigured WAN in packaged UCI defaults
         run: |
           grep -q "^\s*option enabled '0'$" openwrt/luci-app-mwan4/root/etc/config/mwan4

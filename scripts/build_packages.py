@@ -53,8 +53,8 @@ LUCI_PKG_NAME = "luci-app-mwan4"
 PKG_VERSION = "1.0.0"
 # 注意：apk 对「同版本替换（1.0.0-r1 -> 1.0.0-r1）」**不会执行 post-install 钩子**，
 # 只有真正的版本升级才会跑（实机验证）。所以只要二进位/脚本有变，就必须递增 release。
-APK_RELEASE = "r12"
-IPK_RELEASE = "12"
+APK_RELEASE = "r13"
+IPK_RELEASE = "13"
 
 # 新生成金钥的位元数 / 可接受的最小位元数
 KEY_SIZE = 2048
@@ -490,13 +490,8 @@ def make_tar(entries: list[dict]) -> bytes:
 
 POST_INSTALL_TEMPLATE = """#!/bin/sh
 [ "${IPKG_NO_SCRIPT}" = "1" ] && exit 0
-# 先验证设定档，设定错误时留下明确日志，而不是等 daemon 退出触发 procd 重启回圈
-if [ -x /usr/bin/mwan4 ] && [ -f /etc/mwan4/mwan4.json ]; then
-    /usr/bin/mwan4 --check-config /etc/mwan4/mwan4.json >/dev/null 2>&1 || \\
-        logger -t mwan4 "warning: /etc/mwan4/mwan4.json failed --check-config"
-fi
-/etc/init.d/mwan4 enable
-/etc/init.d/mwan4 restart
+# Never enable/restart mwan4 automatically during package installation.
+# Existing users may restart manually after checking their configuration.
 exit 0
 """
 
@@ -592,20 +587,13 @@ fi
 
 chmod +x /usr/bin/mwan4 /etc/init.d/mwan4
 
-if [ -f /etc/mwan4/mwan4.json ]; then
-    if ! /usr/bin/mwan4 --check-config /etc/mwan4/mwan4.json; then
-        echo "Error: /etc/mwan4/mwan4.json failed validation, aborting install" >&2
-        exit 1
-    fi
-fi
-
-/etc/init.d/mwan4 enable
-/etc/init.d/mwan4 restart
+# Never start the service as a side effect of installing the bundle.
+# Users must select their own WAN interface(s), then enable explicitly.
 /etc/init.d/rpcd restart 2>/dev/null || true
 /etc/init.d/uhttpd restart 2>/dev/null || true
 
-echo "==> MWAN4 successfully installed and started!"
-/etc/init.d/mwan4 status || true
+echo "==> MWAN4 installed. Configure WANs in LuCI, then enable the service."
+echo "==> No default routes have been modified by this installer."
 """
 
 
@@ -617,8 +605,7 @@ def read_file(*parts: str) -> bytes:
         return f.read()
 
 
-def build_mwan4_data_entries(bin_data: bytes, init_data: bytes, uci_config_data: bytes,
-                             json_config_data: bytes) -> list[dict]:
+def build_mwan4_data_entries(bin_data: bytes, init_data: bytes, uci_config_data: bytes) -> list[dict]:
     return [
         {"name": "usr", "is_dir": True},
         {"name": "usr/bin", "is_dir": True},
@@ -628,8 +615,6 @@ def build_mwan4_data_entries(bin_data: bytes, init_data: bytes, uci_config_data:
         {"name": "etc/config/mwan4", "data": uci_config_data, "mode": 0o644},
         {"name": "etc/init.d", "is_dir": True},
         {"name": "etc/init.d/mwan4", "data": init_data, "mode": 0o755},
-        {"name": "etc/mwan4", "is_dir": True},
-        {"name": "etc/mwan4/mwan4.json", "data": json_config_data, "mode": 0o644},
     ]
 
 
@@ -792,7 +777,6 @@ def main() -> int:
     # --- 2. 来源档案 ---
     init_data = read_file(ROOT_DIR, "openwrt", "luci-app-mwan4", "root", "etc", "init.d", "mwan4")
     uci_config_data = read_file(ROOT_DIR, "openwrt", "luci-app-mwan4", "root", "etc", "config", "mwan4")
-    json_config_data = read_file(ROOT_DIR, "openwrt", "mwan4.json")
     menu_data = read_file(ROOT_DIR, "openwrt", "luci-app-mwan4", "root", "usr", "share", "luci", "menu.d", "luci-app-mwan4.json")
     acl_data = read_file(ROOT_DIR, "openwrt", "luci-app-mwan4", "root", "usr", "share", "rpcd", "acl.d", "luci-app-mwan4.json")
     view_data = read_file(ROOT_DIR, "openwrt", "luci-app-mwan4", "htdocs", "luci-static", "resources", "view", "mwan4", "overview.js")
@@ -819,7 +803,7 @@ def main() -> int:
         shutil.copy2(bin_src, standalone_bin)
         log(f"[+] Standalone binary: {standalone_bin} ({os.path.getsize(standalone_bin)} bytes)")
 
-        data_entries = build_mwan4_data_entries(bin_data, init_data, uci_config_data, json_config_data)
+        data_entries = build_mwan4_data_entries(bin_data, init_data, uci_config_data)
         apk_ver = f"{PKG_VERSION}-{APK_RELEASE}"
         ipk_ver = f"{PKG_VERSION}-{IPK_RELEASE}"
 
@@ -832,7 +816,7 @@ def main() -> int:
             data_entries=data_entries,
             private_key=private_key,
             post_install=POST_INSTALL_TEMPLATE,
-            depends=[arch.libc_dep],
+            depends=[arch.libc_dep, "ip-full"],
             provides=[f"cmd:{PKG_NAME}={apk_ver}"],
         )
 
@@ -844,8 +828,8 @@ def main() -> int:
             desc="Ultra-lightweight Multi-WAN failover & health monitor daemon for OpenWrt",
             data_entries=data_entries,
             postinst=POST_INSTALL_TEMPLATE,
-            depends=["libc"],
-            conffiles=["/etc/config/mwan4", "/etc/mwan4/mwan4.json"],
+            depends=["libc", "ip-full"],
+            conffiles=["/etc/config/mwan4"],
         )
 
         bundle_path = os.path.join(OUTPUT_DIR, f"mwan4-{arch.key}-bundle.tar.gz")
