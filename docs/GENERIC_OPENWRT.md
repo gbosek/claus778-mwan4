@@ -93,9 +93,13 @@ fails, the snapshot is preserved and a warning logged. As with all route
 restoration, an obsolete gateway after DHCP/PPPoE churn can fail to
 restore; inspect the logged failure and let netifd reacquire the route.
 
-The `stop` hook does not execute during every procd-triggered service
-replacement, and a SIGKILL cannot run Rust shutdown handlers. A future
-iteration must add explicit post-reload recovery and ownership checks.
+This fork adds an explicit `reload_service()` path because OpenWrt's
+default procd reload skips `service_stopped()`. It stops the old
+instance, restores default-route snapshots, and then runs
+`rc_procd start_service` with new interface state. A SIGKILL cannot
+invoke a Rust shutdown handler, and route snapshots can become stale when
+DHCP/PPPoE gateways change; kernel namespace and router tests remain
+required for complete recovery assurance.
 
 Package installation must never enable mwan4 automatically. Preserve
 local UCI config on upgrades. Only enable after reviewing chosen WANs.

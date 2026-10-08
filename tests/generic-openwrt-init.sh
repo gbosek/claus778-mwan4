@@ -121,4 +121,15 @@ MOCK_L3="pppoe-wan"
 MOCK_UP=0
 generate_json_config && exit 1 || :
 assert_empty
-echo "PASS: disabled, empty, manual WAN, netifd IPv4/IPv6, PPPoE policy, down state"
+# procd reload must restore routing after stop, before restarting daemon.
+basescript="/etc/init.d/mwan4"
+MOCK_ORDER=""
+procd_kill() { MOCK_ORDER="${MOCK_ORDER}kill:$1 "; }
+restore_default_routes() { MOCK_ORDER="${MOCK_ORDER}restore "; }
+rc_procd() { MOCK_ORDER="${MOCK_ORDER}start:$1"; }
+reload_service
+[ "$MOCK_ORDER" = "kill:mwan4 restore start:start_service" ] || {
+    echo "unexpected procd reload order: $MOCK_ORDER" >&2
+    exit 1
+}
+echo "PASS: disabled, empty, manual WAN, netifd IPv4/IPv6, PPPoE policy, down state, reload order"
