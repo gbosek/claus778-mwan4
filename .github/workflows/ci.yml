@@ -181,6 +181,17 @@ jobs:
           print("OK", ipk)
           PY
 
+  kernel-netns:
+    name: privileged kernel ECMP / PBR / rollback regression
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: iproute2 network namespace regression
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y iproute2
+          sudo sh tests/netns-kernel-ecmp-pbr.sh
+
   # ── 真实核心 netns 整合测试（advisory）────────────────────────────────
   # GitHub runner 对 unprivileged userns 有 AppArmor 限制时会直接跑不起来，
   # 因此不阻挡主线；本机能跑时才是有效的路由编码验证。
