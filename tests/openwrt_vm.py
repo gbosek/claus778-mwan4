@@ -471,7 +471,16 @@ class Lab:
         self.checkpoint("PASS: DHCP WAN offline and reconnect")
         self.phase = "mwan4 shutdown route rollback"
         self.cmd("/etc/init.d/mwan4 stop")
-        self.wait("! pidof mwan4 >/dev/null", 35)
+        try:
+            self.wait("! pidof mwan4 >/dev/null", 35)
+        except (AssertionError, pexpect.TIMEOUT, pexpect.EOF):
+            self.cmd("pidof mwan4 || true")
+            self.cmd("cat /var/run/mwan4.pid 2>/dev/null || true")
+            self.cmd("ps w")
+            self.cmd("ubus call service list '{\"name\":\"mwan4\"}' || true")
+            self.cmd("logread -e mwan4 || true")
+            self.cmd("ls -l /tmp/mwan4_status.json /var/run/mwan4.pid 2>&1 || true")
+            raise
         self.cmd("! ip -4 route show table main default proto 77 | grep -q .")
         self.cmd("ip -4 rule show | grep -q fwmark")
         self.cmd("ip -4 route show table main default | grep -q .")
