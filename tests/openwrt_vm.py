@@ -293,8 +293,20 @@ class Lab:
         self.cmd("ifup pppwan")
         self.wait('ubus call network.interface.pppwan status | grep -q \'"up": true\'', 110)
         self.wait("pidof mwan4 >/dev/null", 45)
-        self.cmd(". /lib/functions/network.sh; "
-                 "network_get_device pppdev pppwan; grep -Fq \"$pppdev\" /var/etc/mwan4.json")
+        # procd reloads asynchronously after the netifd logical interface
+        # announces UP. Poll for configuration/device convergence instead of
+        # assuming that observing the daemon PID proves reload completion.
+        l3_check = (". /lib/functions/network.sh; "
+                    "network_get_device pppdev pppwan; "
+                    "test -n \"$pppdev\" && grep -Fq \"$pppdev\" /var/etc/mwan4.json")
+        try:
+            self.wait(l3_check, timeout=70)
+        except (AssertionError, pexpect.TIMEOUT):
+            self.cmd("ubus call network.interface.pppwan status")
+            self.cmd("cat /var/etc/mwan4.json")
+            self.cmd("logread -e mwan4")
+            self.cmd("ip -4 route show table main default")
+            raise
         self.checkpoint("PASS: PPPoE redial and dynamic L3 interface mapping")
         self.phase = "PBR and firewall4 coexistence"
         for key, value in (
