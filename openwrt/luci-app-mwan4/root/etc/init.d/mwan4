@@ -69,29 +69,30 @@ restore_default_routes() {
 	local family snap size
 	for family in 4 6; do
 		snap="$ROUTE_SNAPSHOT_DIR/default$family.bin"
+		# Even without a saved original default, a user-requested stop
+		# must clean up mwan4-owned routes. Do not touch non-owned routes.
+		if ! ip "-$family" route flush table main default proto 77; then
+			logger -t mwan4 "IPv$family: could not remove owned proto-77 route; leaving snapshot"
+			continue
+		fi
 		[ -f "$snap" ] || continue
 		size="$(wc -c < "$snap" 2>/dev/null)" || continue
 		if [ "$size" -le 4 ]; then
-			# No original default was saved. Keep an existing route as an
-			# emergency fallback, rather than strand the administrator.
-			logger -t mwan4 "IPv$family snapshot had no default; not flushing active route"
+			# The original route table did not contain a default.
+			logger -t mwan4 "IPv$family had no original default; netifd owns recovery"
 			rm -f "$snap"
 			continue
 		fi
-		# Remove ONLY the managed route. netifd remains authoritative:
-		# prefer a CURRENT default over a stale saved PPPoE/DHCP gateway.
-		if ! ip "-$family" route flush table main default proto 77; then
-			logger -t mwan4 "Failed to remove owned IPv$family default route; snapshot retained"
-			continue
-		fi
+		# Prefer CURRENT netifd state. A saved DHCP/PPPoE gateway may be
+		# obsolete after a renew or redial and must not be replayed.
 		if ip "-$family" route show table main default | grep -q .; then
-			logger -t mwan4 "IPv$family current netifd default exists; discarding obsolete route snapshot"
+			logger -t mwan4 "IPv$family current default exists; discarding older snapshot"
 			rm -f "$snap"
 		elif ip "-$family" route restore < "$snap"; then
-			logger -t mwan4 "Restored saved IPv$family default route as emergency fallback"
+			logger -t mwan4 "IPv$family emergency route snapshot restored"
 			rm -f "$snap"
 		else
-			logger -t mwan4 "IPv$family restore failed, likely stale gateway; snapshot retained"
+			logger -t mwan4 "IPv$family restore failed; check current netifd state; keeping snapshot"
 		fi
 	done
 	rmdir "$ROUTE_SNAPSHOT_DIR" 2>/dev/null || :
