@@ -133,7 +133,10 @@ ip() {
         "-4 route save table main default") printf 'ORIGINAL-IPv4'; return 0 ;;
         "-6 route save table main default") printf 'HEAD'; return 0 ;;
         "-4 route flush table main default proto 77" | \
+        "-6 route flush table main default proto 77" | \
         "-4 route restore") return 0 ;;
+        "-4 route show table main default" | \
+        "-6 route show table main default") return 0 ;;
         *) echo "unsafe or unexpected ip call: $*" >&2; return 1 ;;
     esac
 }
@@ -143,7 +146,42 @@ snapshot_default_routes
 restore_default_routes
 grep -q -- '^-4 route flush table main default proto 77$' "$IP_CALLS"
 grep -q -- '^-4 route restore$' "$IP_CALLS"
-! grep -q -- '^-6 route flush' "$IP_CALLS"
+grep -q -- '^-6 route flush table main default proto 77
+[ ! -e "$ROUTE_SNAPSHOT_DIR/default4.bin" ]
+[ ! -e "$ROUTE_SNAPSHOT_DIR/default6.bin" ]
+
+# Metric preflight: netifd defaults must have higher metrics than mwan4.
+MOCK_BASELINE_METRIC=100
+ip() {
+    case "$*" in
+        "-4 -o route show table main default")
+            printf 'default via 192.0.2.1 dev eth7 metric %s\n' "$MOCK_BASELINE_METRIC" ;;
+        "-6 -o route show table main default")
+            printf 'default via 2001:db8::1 dev eth7 proto ra metric 1024\n' ;;
+        *) echo "unexpected metric-check ip call: $*" >&2; return 1 ;;
+    esac
+}
+verify_default_route_metric 10
+MOCK_BASELINE_METRIC=10
+if verify_default_route_metric 10; then echo "same metric accepted" >&2; exit 1; fi
+MOCK_BASELINE_METRIC=5
+if verify_default_route_metric 10; then echo "lower metric accepted" >&2; exit 1; fi
+MOCK_BASELINE_METRIC=100
+verify_default_route_metric 10
+
+# rc.common must stop old daemon and restore before starting new routing.
+basescript="/etc/init.d/mwan4"
+MOCK_ORDER=""
+procd_kill() { MOCK_ORDER="${MOCK_ORDER}kill:$1 "; }
+restore_default_routes() { MOCK_ORDER="${MOCK_ORDER}restore "; }
+rc_procd() { MOCK_ORDER="${MOCK_ORDER}start:$1"; }
+reload_service
+[ "$MOCK_ORDER" = "kill:mwan4 restore start:start_service" ] || {
+    echo "unexpected reload order: $MOCK_ORDER" >&2
+    exit 1
+}
+echo "PASS: unconfigured, PPPoE, IPv4/IPv6, PBR, metric guard, route snapshots, reload"
+ "$IP_CALLS"
 [ ! -e "$ROUTE_SNAPSHOT_DIR/default4.bin" ]
 [ ! -e "$ROUTE_SNAPSHOT_DIR/default6.bin" ]
 
