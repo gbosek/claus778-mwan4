@@ -155,6 +155,13 @@ class Lab:
             self.command_error(command, exc)
             raise
 
+    def dump_routing_diagnostics(self):
+        self.cmd(
+            "ip -4 rule show; ip -4 route show table all; "
+            "nft list ruleset || true",
+            timeout=60,
+        )
+
     def guest_job(self, command, name, timeout=120):
         """Run a long operation asynchronously without GNU timeout in guest.
 
@@ -389,25 +396,31 @@ class Lab:
                 "ip -4 rule show | grep -Eq 'fwmark (0x)?0(/|[[:space:]]|$)|not fwmark'"
             )
         except (AssertionError, pexpect.TIMEOUT, pexpect.EOF):
-            for command in (
-                "ip -4 rule show",
-                "ip -4 route show table all",
-                "nft list ruleset",
-            ):
-                self.cmd(f"{command} || true")
+            self.dump_routing_diagnostics()
             raise
-        marked = self.cmd(
-            f"ip -4 route get 198.18.0.1 from 192.0.2.10 mark {pbr_mark}"
-        )
-        if not re.search(r"\bdev eth2\b", marked):
-            raise AssertionError(f"marked PBR traffic did not select dhcpwan: {marked}")
-        unmarked = self.cmd(
-            "ip -4 route get 198.18.0.1 from 192.0.2.10"
-        )
-        if not re.search(r"\bdev ppp[^\s]*\b", unmarked):
-            raise AssertionError(
-                f"unmarked traffic did not retain PPPoE native policy: {unmarked}"
+        try:
+            marked = self.cmd(
+                f"ip -4 route get 198.18.0.1 from 192.0.2.10 mark {pbr_mark}"
             )
+            if not re.search(r"\bdev eth2\b", marked):
+                raise AssertionError(
+                    f"marked PBR traffic did not select dhcpwan: {marked}"
+                )
+        except (AssertionError, pexpect.TIMEOUT, pexpect.EOF):
+            self.dump_routing_diagnostics()
+            raise
+        try:
+            unmarked = self.cmd(
+                "ip -4 route get 198.18.0.1 from 192.0.2.10"
+            )
+            if not re.search(r"\bdev ppp[^\s]*\b", unmarked):
+                raise AssertionError(
+                    "unmarked traffic did not retain PPPoE native policy: "
+                    f"{unmarked}"
+                )
+        except (AssertionError, pexpect.TIMEOUT, pexpect.EOF):
+            self.dump_routing_diagnostics()
+            raise
         self.checkpoint("PASS: overlapping PBR mark beats native policy, unmarked stays PPPoE")
         self.checkpoint("PASS: real firewall4 + standalone PBR mark coexistence")
         self.phase = "DHCP WAN failover and recovery"
