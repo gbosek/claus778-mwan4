@@ -2723,8 +2723,13 @@ mod tests {
     #[test]
     #[ignore]
     fn netns_hash_policy_drift_repair() {
-        if std::env::var("MWAN4_NETNS_TEST").as_deref() != Ok("1") {
-            eprintln!("skip: set MWAN4_NETNS_TEST=1 and run inside `unshare -Urn`");
+        let requested = std::env::var("MWAN4_NETNS_TEST").as_deref() == Ok("1");
+        let isolated = std::fs::read_link("/proc/self/ns/net")
+            .ok()
+            .zip(std::fs::read_link("/proc/1/ns/net").ok())
+            .is_some_and(|(current, init)| current != init);
+        if !requested || !isolated {
+            eprintln!("skip: tests require MWAN4_NETNS_TEST=1 AND isolated network namespace");
             return;
         }
         let original = read_effective_hash_v4();

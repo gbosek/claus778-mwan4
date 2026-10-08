@@ -103,3 +103,16 @@ required for complete recovery assurance.
 
 Package installation must never enable mwan4 automatically. Preserve
 local UCI config on upgrades. Only enable after reviewing chosen WANs.
+
+## Source audit follow-up
+
+- Rust policy sweep now drains all protocol-tagged rules for a reserved
+  priority, as policy expansion may generate multiple rules per priority.
+- The old checked-in `dist/install.sh` was intentionally disabled because it
+  predated safe-first-run and still enabled the daemon automatically. Build
+  fresh packages from current sources rather than using repository `dist/`.
+- Kernel-mutating Rust netns tests now require a different network namespace
+  from PID 1 **in addition to** `MWAN4_NETNS_TEST=1`; do not run privileged
+  tests on a production router.
+- The JSON status key is now `load_shifted`, not `offloaded`. It represents
+  dynamic traffic shifting and does not imply hardware flow offload.

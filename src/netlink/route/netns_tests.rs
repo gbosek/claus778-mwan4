@@ -21,7 +21,15 @@ use crate::config::{DaemonConfig, MultipathHashPolicy};
 const ENV_GATE: &str = "MWAN4_NETNS_TEST";
 
 fn netns_enabled() -> bool {
-    std::env::var(ENV_GATE).as_deref() == Ok("1")
+    if std::env::var(ENV_GATE).as_deref() != Ok("1") {
+        return false;
+    }
+    // The environment variable alone does not isolate a live router.
+    // Require a different netns from PID 1 before modifying any FIB rules.
+    std::fs::read_link("/proc/self/ns/net")
+        .ok()
+        .zip(std::fs::read_link("/proc/1/ns/net").ok())
+        .is_some_and(|(current, init)| current != init)
 }
 
 fn sh(args: &[&str]) -> bool {
