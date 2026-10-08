@@ -1,6 +1,7 @@
 #!/bin/sh
-# Optional, read-only PBR compatibility/diagnostics for Rust ECMP mwan4.
-# Does not install or rewrite ip/nft rules and never enables PBR automatically.
+# Optional PBR compatibility diagnostics for Rust ECMP mwan4.
+# Installing this addon allows mwan4 to skip marked flows in its native policies.
+# This helper itself never modifies routing, firewall or service states.
 set -u
 say() { printf '%s\n' "$*"; }
 warn() { printf 'WARN: %s\n' "$*" >&2; }
@@ -36,7 +37,7 @@ check() {
 		warn "PBR netifd strict enforcement can alter default routing; verify it does not override ECMP"
 	fi
 	if [ "$failed" = 0 ]; then
-		say "Basic check passed: standalone PBR may mark selected flows; other flows remain on FIB/ECMP."
+		say "Basic check passed: marked PBR flows bypass native policies; unmatched flows retain FIB/ECMP."
 	else
 		warn "PBR compatibility check found blocking problems."
 	fi

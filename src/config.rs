@@ -293,6 +293,9 @@ pub struct DaemonConfig {
     /// 来源/目的策略分流规则（选填）；匹配的转发流量走指定 WAN，目标 WAN DOWN 时回退 ECMP。
     #[serde(default)]
     pub policies: Vec<PolicyConfig>,
+    /// Opt-in PBR packet mark mask. Native policies only match when masked mark bits are zero.
+    #[serde(default)]
+    pub policy_skip_mark_mask: Option<u32>,
     /// WAN 接口配置列表
     pub interfaces: Vec<InterfaceConfig>,
     /// 未知栏位（以 `_` 开头者视为注解）；validate() 会拒绝真正的拼字错误。
@@ -411,6 +414,7 @@ impl Default for DaemonConfig {
             load_recover_ratio: default_load_recover_ratio(),
             allow_dynamic_weights_on_standard: false,
             policies: Vec::new(),
+            policy_skip_mark_mask: None,
             interfaces: vec![
                 InterfaceConfig {
                     name: "wan1".to_string(),
@@ -458,6 +462,9 @@ impl DaemonConfig {
     pub fn validate(&self) -> Result<(), String> {
         if self.interfaces.is_empty() {
             return Err("At least one WAN interface must be configured".into());
+        }
+        if self.policy_skip_mark_mask == Some(0) {
+            return Err("policy_skip_mark_mask must be nonzero".into());
         }
         // 每张 WAN 会占用一个探针 slot（独立表＋oif 规则），slot 数有上限
         if self.interfaces.len() > crate::netlink::route::PROBE_SLOT_MAX as usize {

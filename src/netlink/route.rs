@@ -124,6 +124,8 @@ pub const POLICY_SLOT_MAX: u32 = 64;
 /// enum fib_rule_attr：来源/目的前缀
 pub const FRA_DST: u16 = 1;
 pub const FRA_SRC: u16 = 2;
+pub const FRA_FWMARK: u16 = 10;
+pub const FRA_FWMASK: u16 = 16;
 /// 探针目标主表 /32 的 metric；与预设路由 priority 分开才能精准辨识删除。
 pub const PROBE_MAIN_ROUTE_METRIC: u32 = 42_760;
 
@@ -378,6 +380,8 @@ pub struct PolicyRule {
     pub source: Option<(Ipv4Addr, u8)>,
     /// 目的前缀（None = 不限制）
     pub destination: Option<(Ipv4Addr, u8)>,
+    /// When set, exclude packets selected by the PBR mark mask.
+    pub skip_mark_mask: Option<u32>,
 }
 
 /// 一条 fib_rule 的描述（出向用 oif、入向用 iif）
@@ -1017,6 +1021,10 @@ impl RouteManager {
         }
         if let Some((addr, _)) = rule.destination {
             Self::append_attr(&mut buffer, FRA_DST, &addr.octets());
+        }
+        if let Some(mask) = rule.skip_mark_mask {
+            Self::append_attr(&mut buffer, FRA_FWMARK, &0u32.to_ne_bytes());
+            Self::append_attr(&mut buffer, FRA_FWMASK, &mask.to_ne_bytes());
         }
         Self::append_attr(&mut buffer, FRA_PROTOCOL, &[PROBE_RULE_PROTOCOL]);
 
@@ -3747,6 +3755,7 @@ mod tests {
             priority: POLICY_RULE_PRIORITY_BASE + 2,
             source: Some(("192.168.3.0".parse().unwrap(), 24)),
             destination: Some(("10.0.0.0".parse().unwrap(), 8)),
+            skip_mark_mask: None,
         };
         let msg = RouteManager::build_policy_rule_msg(
             11,
@@ -3780,6 +3789,7 @@ mod tests {
             priority: POLICY_RULE_PRIORITY_BASE,
             source: None,
             destination: None,
+            skip_mark_mask: None,
         };
         let msg = RouteManager::build_policy_rule_msg(
             12,

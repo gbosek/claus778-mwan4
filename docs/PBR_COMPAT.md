@@ -23,3 +23,7 @@ Recommended development sequence:
 2. Verify that non-matching packets remain unmarked in mwan4's data plane.
 3. Verify WAN fail/recovery with selected policies before adding automatic
    suppression/reinstatement or more advanced LuCI support.
+
+## Opt-in PBR fwmark exclusion
+
+Install `mwan4-pbr-compat` separately and enable standalone OpenWrt PBR. With both present, the init script obtains PBR's `fw_mask` (default `00ff0000`) and emits `policy_skip_mark_mask` to the Rust daemon; invalid or zero masks cause start refusal. The Rust netlink rule for native source/destination policies then includes FWMARK=0 and FWMASK=<mask>. PBR-marked packets skip native priority 9000 policies and reach PBR's own later fwmark rules. Unmarked packets keep native policies/default ECMP; the adapter changes neither PBR configuration nor priorities. On PBR UCI changes mwan4 reloads, but real netifd/PBR service race conditions need testing. This is not full PBR strategy group synchronization.

@@ -722,6 +722,7 @@ fn netns_policy_routing() {
         priority: POLICY_RULE_PRIORITY_BASE,
         source: Some(("192.168.9.0".parse().unwrap(), 24)),
         destination: None,
+        skip_mark_mask: None,
     };
     rm.set_policy_rules(std::slice::from_ref(&rule))
         .expect("install policy rule");
@@ -738,6 +739,26 @@ fn netns_policy_routing() {
         "来源分流未生效（应走 mwp1 / table 10001）:\n{get}"
     );
 
+    // Simulate standalone PBR at 30000, after native policy priority 9000.
+    assert!(sh(&["ip", "route", "add", "default", "dev", "mwp0", "table", "201"]));
+    assert!(sh(&[
+        "ip", "rule", "add", "pref", "30000",
+        "fwmark", "0x10000/0xff0000", "lookup", "201",
+    ]));
+    let masked = PolicyRule { skip_mark_mask: Some(0x00ff0000), ..rule.clone() };
+    rm.set_policy_rules(&[masked]).expect("enable PBR mark exemption");
+    let pbr_hit = sh_out(&[
+        "ip", "route", "get", "8.8.8.8", "from", "192.168.9.5",
+        "mark", "0x10000",
+    ]);
+    assert!(pbr_hit.contains("dev mwp0"), "PBR mark did not win: {pbr_hit}");
+    let native_hit = sh_out(&["ip", "route", "get", "8.8.8.8", "from", "192.168.9.5"]);
+    assert!(native_hit.contains("dev mwp1"), "Unmarked native policy failed: {native_hit}");
+    rm.set_policy_rules(std::slice::from_ref(&rule))
+        .expect("restore legacy native policy");
+    assert!(sh(&["ip", "rule", "del", "pref", "30000"]));
+    assert!(sh(&["ip", "route", "flush", "table", "201"]));
+
     // 目的限定的规则也要能安装与匹配
     let scoped = PolicyRule {
         name: "guest-dst".to_string(),
@@ -746,6 +767,7 @@ fn netns_policy_routing() {
         priority: POLICY_RULE_PRIORITY_BASE + 1,
         source: Some(("192.168.9.0".parse().unwrap(), 24)),
         destination: Some(("203.0.113.0".parse().unwrap(), 24)),
+        skip_mark_mask: None,
     };
     rm.set_policy_rules(&[rule.clone(), scoped.clone()])
         .expect("install scoped policy rule");
@@ -769,6 +791,7 @@ fn netns_policy_routing() {
         priority: POLICY_RULE_PRIORITY_BASE,
         source: Some(("192.168.8.0".parse().unwrap(), 24)),
         destination: None,
+        skip_mark_mask: None,
     };
     rm.set_policy_rules(&[rule, additional_rule])
         .expect("install two rules on the same priority");

@@ -232,6 +232,27 @@ generate_json_config() {
 		return 1
 	fi
 
+	# Optional PBR addon: allow PBR-marked packets to pass through native
+	# source/destination policies and reach PBR's own later fwmark rules.
+	# The base package never installs, starts, or changes PBR.
+	local pbr_skip_mask_json="null" pbr_mask pbr_enabled
+	if [ -x /usr/libexec/mwan4-pbr-compat ] && [ -f /etc/config/pbr ] && command -v uci >/dev/null 2>&1; then
+		pbr_enabled="$(uci -q get pbr.config.enabled 2>/dev/null || :)"
+		if [ "$pbr_enabled" = "1" ]; then
+			pbr_mask="$(uci -q get pbr.config.fw_mask 2>/dev/null || :)"
+			[ -n "$pbr_mask" ] || pbr_mask="00ff0000"
+			if ! printf '%s' "$pbr_mask" | grep -Eq '^[[:xdigit:]]{8}$'; then
+				logger -t mwan4 "Invalid PBR fw_mask; cannot safely exclude marked flows"
+				return 1
+			fi
+			pbr_skip_mask_json="$(printf '%d' "0x$pbr_mask" 2>/dev/null)" || return 1
+			if [ "$pbr_skip_mask_json" = "0" ]; then
+				logger -t mwan4 "PBR fw_mask must be nonzero"
+				return 1
+			fi
+		fi
+	fi
+
 	# 策略分流规则（可多个 config policy 段）；字串转义、priority 验证，更细格式（CIDR）交给 daemon --check-config
 	local policies_json="" policy_invalid=0
 	handle_policy() {
@@ -338,6 +359,7 @@ generate_json_config() {
 	  "load_target_ratio": $load_target,
 	  "load_recover_ratio": $load_recover,
 	  "allow_dynamic_weights_on_standard": $dyn_standard_str,
+	  "policy_skip_mark_mask": $pbr_skip_mask_json,
 	  "policies": [ $policies_json ],
 	  "flush_conntrack_on_down": $flush_str,
 	  "flush_conntrack_on_switch": $flush_switch_str,
@@ -601,7 +623,7 @@ _mwan4_netifd_trigger() {
 }
 
 service_triggers() {
-	procd_add_reload_trigger "mwan4" "network"
+	procd_add_reload_trigger "mwan4" "network" "pbr"
 	config_load mwan4
 	config_foreach _mwan4_netifd_trigger interface
 }

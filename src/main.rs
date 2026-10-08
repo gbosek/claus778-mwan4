@@ -2394,6 +2394,7 @@ fn build_policy_rules(config: &DaemonConfig, monitors: &[WanMonitor]) -> Vec<Pol
                     priority,
                     source: *source,
                     destination: *destination,
+                    skip_mark_mask: config.policy_skip_mark_mask,
                 });
             }
         }
