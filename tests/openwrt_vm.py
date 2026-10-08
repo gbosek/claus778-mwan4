@@ -154,6 +154,29 @@ class Lab:
             self.command_error(command, exc)
             raise
 
+    def guest_job(self, command, name, timeout=120):
+        """Run a long operation asynchronously without GNU timeout in guest.
+
+        Only POSIX ash builtins are needed. The host controls the deadline
+        using pexpect's explicit polling, while the full stdout/stderr stays
+        in a guest file that gets echoed on any failure.
+        """
+        if not re.fullmatch(r"[a-z][a-z0-9-]*", name):
+            raise ValueError(f"invalid guest job label: {name}")
+        logfile = f"/tmp/mwan4-{name}.log"
+        rcfile = f"/tmp/mwan4-{name}.rc"
+        self.cmd(f"rm -f {rcfile}")
+        script = f"({command} >{logfile} 2>&1; echo $? >{rcfile}) &"
+        self.cmd(script)
+        try:
+            self.wait(f"test -f {rcfile}", timeout=timeout)
+            self.cmd(f'test "$(cat {rcfile})" = 0')
+        except (AssertionError, pexpect.TIMEOUT):
+            self.cmd(f"tail -n 50 {logfile}")
+            self.cmd("ip route show default")
+            raise
+        return logfile
+
     def wait(self, command, timeout=90):
         deadline, error = time.monotonic() + timeout, ""
         while time.monotonic() < deadline:
@@ -210,17 +233,11 @@ class Lab:
         self.cmd("nslookup downloads.openwrt.org >/tmp/mwan4-dns.log 2>&1",
                  timeout=35)
         # Genuine distro PBR/firewall4 package, not mock nft rule sets.
-        # Each attempt is bounded; the real guest log is reported on failure.
-        try:
-            self.cmd("timeout 90 opkg update >/tmp/mwan4-opkg-update.log 2>&1",
-                     timeout=110)
-        except (AssertionError, pexpect.TIMEOUT):
-            self.cmd("tail -n 45 /tmp/mwan4-opkg-update.log")
-            self.cmd("ip route show default")
-            self.cmd("cat /tmp/mwan4-dns.log")
-            raise
-        self.cmd("timeout 110 opkg install ppp ppp-mod-pppoe ip-full nftables-json pbr >/tmp/mwan4-opkg-install.log 2>&1",
-                 timeout=130)
+        # OpenWrt base BusyBox lacks the 'timeout' applet. Poll a background
+        # ash job with a host-side deadline so no GNU binaries are assumed.
+        self.guest_job("opkg update", "opkg-update", timeout=140)
+        self.guest_job("opkg install ppp ppp-mod-pppoe ip-full nftables-json pbr",
+                       "opkg-install", timeout=170)
         self.checkpoint("PASS: actual OpenWrt package feeds and PBR packages")
         self.cmd("mkdir -p /usr/libexec /etc/config; "
                  "wget -qO /usr/bin/mwan4 http://10.0.2.2:8093/mwan4; "
