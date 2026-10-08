@@ -386,7 +386,7 @@ class Lab:
         self.cmd("ip -4 rule show | grep -q 'from 192.0.2.0/24'")
         try:
             self.cmd(
-                "ip -4 rule show | grep -Eq 'fwmark 0x0(/|[[:space:]]|$)|not fwmark'"
+                "ip -4 rule show | grep -Eq 'fwmark (0x)?0(/|[[:space:]]|$)|not fwmark'"
             )
         except (AssertionError, pexpect.TIMEOUT, pexpect.EOF):
             for command in (
