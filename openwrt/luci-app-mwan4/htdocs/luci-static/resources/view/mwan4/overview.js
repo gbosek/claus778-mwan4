@@ -1099,14 +1099,14 @@ return view.extend({
 		poll.add(this.pollFn, 5);
 
 		m = new form.Map('mwan4', _('MWAN4 Configuration'),
-			_('Multi-WAN interfaces and health probes via UCI. Save & Apply reloads the daemon.'));
+			_('Disabled until configured: add your own network interfaces and enable the daemon when ready. No fixed number of WANs is required.'));
 
 		s = m.section(form.NamedSection, 'global', 'global', _('Global Settings'));
 		s.tab('basic', _('Basic'));
 		s.tab('advanced', _('Advanced'));
 
 		o = s.taboption('basic', form.Flag, 'enabled', _('Enable MWAN4 Daemon'));
-		o.default = o.enabled;
+		o.default = o.disabled;
 		o.rmempty = false;
 
 		o = s.taboption('basic', form.Value, 'check_interval_ms', _('Probe Interval (ms)'),
@@ -1197,23 +1197,27 @@ return view.extend({
 		o.default = o.enabled;
 		o.editable = true;
 
-		o = s.option(form.Value, 'name', _('Interface Name'));
-		o.rmempty = false;
+		o = s.option(form.ListValue, 'network', _('OpenWrt Logical WAN'),
+			_('Select the OpenWrt network interface. The live L3 device and gateway are resolved by netifd, including after PPPoE redial.'));
+		o.value('', _('Manual device (advanced)'));
+		uci.sections('network', 'interface').forEach(function(sec) {
+			if (sec['.name'] && sec['.name'] !== 'loopback' &&
+			    sec['.name'] !== 'lan' && sec.proto !== 'none')
+				o.value(sec['.name'], sec['.name']);
+		});
+		o.rmempty = true;
 		o.editable = true;
-		if (netdevs.length) {
-			netdevs.forEach(function(dev) {
-				o.value(dev);
-			});
-		} else {
-			uci.sections('network', 'interface').forEach(function(sec) {
-				if (sec['.name'] && sec['.name'] !== 'loopback' && sec['.name'] !== 'lan')
-					o.value(sec['.name']);
-			});
-		}
 
-		o = s.option(form.Value, 'gateway', _('Gateway IP'));
+		o = s.option(form.Value, 'name', _('Manual Linux Device'),
+			_('Only needed without a logical network selection. The selected network takes precedence.'));
+		o.rmempty = true;
+		o.editable = true;
+		netdevs.forEach(function(dev) { o.value(dev); });
+
+		o = s.option(form.Value, 'gateway', _('IPv4 Gateway (optional)'),
+			_('Leave empty to use the dynamic netifd gateway; PPPoE normally needs no explicit gateway.'));
 		o.datatype = 'ip4addr';
-		o.rmempty = false;
+		o.rmempty = true;
 		o.editable = true;
 
 		o = s.option(form.Value, 'metric', _('Metric (Priority)'),
@@ -1263,7 +1267,8 @@ return view.extend({
 		o.rmempty = false;
 		o.editable = true;
 		uci.sections('mwan4', 'interface').forEach(function(sec) {
-			if (sec.name) o.value(sec.name, sec.name);
+			if (sec['.name'])
+				o.value(sec['.name'], sec.network || sec.name || sec['.name']);
 		});
 
 		o = s.option(form.Value, 'priority', _('Rule Priority'));

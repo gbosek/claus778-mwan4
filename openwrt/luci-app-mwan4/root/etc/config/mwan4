@@ -1,5 +1,5 @@
 config global 'global'
-	option enabled '1'
+	option enabled '0'
 	option check_interval_ms '500'
 	option probe_timeout_ms '400'
 	option window_size '10'
@@ -37,24 +37,18 @@ config global 'global'
 	option dynamic_weight_interval_ms '10000'
 	option dynamic_weight_min_ratio '0.25'
 
-config interface 'wan1'
-	option enabled '1'
-	option name 'wan1'
-	option gateway '192.168.1.1'
-	option metric '10'
-	option weight '1'
-	# 该线最大频宽（Mbps）：设定后 ECMP 基准权重 ∝ 最大频宽，也作 LAN 下载容量；up_mbps 为 LAN 上传方向（未填沿用 max）
-	list probe_targets '223.5.5.5:53'
-	list probe_targets '114.114.114.114:53'
-
-config interface 'wan2'
-	option enabled '1'
-	option name 'wan2'
-	option gateway '192.168.2.1'
-	option metric '10'
-	option weight '1'
-	list probe_targets '223.5.5.5:53'
-	list probe_targets '114.114.114.114:53'
+# No interfaces are preconfigured. On first installation this package will
+# NOT manage the default route; explicitly add WANs in LuCI and enable service.
+# Example (commented; the user must select their own existing logical WAN):
+# config interface 'uplink'
+#     option enabled '1'
+#     option network 'wan'
+#     option metric '10'
+#     option weight '1'
+#     list probe_targets '1.1.1.1:53'
+#
+# Legacy/manual mode still accepts option name 'ethX'. On PPPoE interfaces
+# select option network instead of the underlying physical Ethernet device.
 
 # 策略分流：匹配来源（可选目的）的流量走指定 WAN，其余仍走 ECMP；目标 WAN DOWN 时规则自动移除。可有多个 config policy 段。
 # 例：#config policy 'guest' / list source '192.168.3.0/24' / list destination '10.0.0.0/8' / option interface 'wan2' / option priority '9000'
