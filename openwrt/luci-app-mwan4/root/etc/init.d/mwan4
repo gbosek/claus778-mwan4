@@ -7,6 +7,67 @@ USE_PROCD=1
 PROG=/usr/bin/mwan4
 CONF_DIR=/var/etc
 CONF_FILE="$CONF_DIR/mwan4.json"
+# Route snapshots are runtime-only. Never persist another router's gateways
+# across reboots. Requires ip-full's binary "route save/restore" support.
+ROUTE_SNAPSHOT_DIR=/var/run/mwan4-route-backup
+
+# Snapshot current main-table defaults BEFORE the Rust daemon installs its
+# own proto-77 default route. Existing snapshots survive daemon reloads.
+snapshot_default_routes() {
+	local family snap tmp
+	mkdir -p "$ROUTE_SNAPSHOT_DIR" || return 1
+	chmod 700 "$ROUTE_SNAPSHOT_DIR" || return 1
+	for family in 4 6; do
+		snap="$ROUTE_SNAPSHOT_DIR/default$family.bin"
+		[ -e "$snap" ] && continue
+		# A leftover mwan4 route is not an original netifd route. Refuse to
+		# snapshot it, as restoring it would recreate stale ECMP nexthops.
+		if ip "-$family" route show table main default proto 77 | grep -q .; then
+			logger -t mwan4 "Skipping IPv$family snapshot: mwan4 route already present"
+			continue
+		fi
+		tmp="$snap.tmp.$$"
+		if ! ip "-$family" route save table main default > "$tmp"; then
+			rm -f "$tmp"
+			logger -t mwan4 "IPv$family default route snapshot failed (ip-full required)"
+			return 1
+		fi
+		mv -f "$tmp" "$snap" || return 1
+	done
+}
+
+# Called by rc.common after procd_kill has stopped the daemon.
+# Only touch default routes identified as mwan4 proto-77. Do not flush
+# main-table LAN routes, PBR tables, IP rules, or conntrack on service stop.
+restore_default_routes() {
+	local family snap size
+	for family in 4 6; do
+		snap="$ROUTE_SNAPSHOT_DIR/default$family.bin"
+		[ -f "$snap" ] || continue
+		size="$(wc -c < "$snap" 2>/dev/null)" || continue
+		if [ "$size" -le 4 ]; then
+			# No original default was saved. Keep an existing route as an
+			# emergency fallback, rather than strand the administrator.
+			logger -t mwan4 "IPv$family snapshot had no default; not flushing active route"
+			rm -f "$snap"
+			continue
+		fi
+		# remove_routes_on_exit may already have cleaned it up.
+		if ip "-$family" route flush table main default proto 77 && \
+		   ip "-$family" route restore < "$snap"; then
+			logger -t mwan4 "Restored IPv$family main-table default route snapshot"
+			rm -f "$snap"
+		else
+			logger -t mwan4 "IPv$family route restore failed; snapshot retained at $snap"
+		fi
+	done
+	rmdir "$ROUTE_SNAPSHOT_DIR" 2>/dev/null || :
+}
+
+service_stopped() {
+	restore_default_routes
+}
+
 
 # UCI 值直接拼进 JSON，有写入权限者（rpcd ACL 开放）可用引号/反斜线/换行注入栏位，故字串一律转义、数字一律先验证
 json_escape() {
@@ -275,7 +336,7 @@ generate_json_config() {
 	local invalid_iface=0
 	handle_interface() {
 		local section="$1"
-		local if_enabled name gateway metric weight network_iface resolved_name
+		local if_enabled name gateway gateway6 metric weight network_iface network_iface6 resolved_name resolved_name6
 		config_get_bool if_enabled "$section" enabled 1
 		[ "$if_enabled" -eq 1 ] || return 0
 
@@ -284,6 +345,8 @@ generate_json_config() {
 		config_get network_iface "$section" network ""
 		config_get name "$section" name ""
 		config_get gateway "$section" gateway ""
+		config_get gateway6 "$section" gateway6 ""
+		config_get network_iface6 "$section" network6 ""
 		if [ -n "$network_iface" ]; then
 			case "$network_iface" in
 				*[!a-zA-Z0-9_.-]*)
@@ -294,7 +357,8 @@ generate_json_config() {
 			esac
 			if ! command -v network_get_device >/dev/null 2>&1 || \
 			   ! network_get_device resolved_name "$network_iface" || \
-			   [ -z "$resolved_name" ]; then
+			   [ -z "$resolved_name" ] || \
+			   { command -v network_is_up >/dev/null 2>&1 && ! network_is_up "$network_iface"; }; then
 				# Never fall back to PPPoE's physical Ethernet carrier.
 				logger -t mwan4 "section '$section': network '$network_iface' has no L3 device; waiting for netifd"
 				return 0
@@ -302,6 +366,19 @@ generate_json_config() {
 			name="$resolved_name"
 			if [ -z "$gateway" ]; then
 				network_get_gateway gateway "$network_iface" 2>/dev/null || gateway=""
+			fi
+		fi
+		# For dual-stack WANs, network6 may be a separate netifd logical
+		# interface (e.g. wan6). The kernel L3 device must be identical.
+		[ -n "$network_iface6" ] || network_iface6="$network_iface"
+		if [ -z "$gateway6" ] && [ -n "$network_iface6" ]; then
+			if command -v network_get_device >/dev/null 2>&1 && \
+			   network_get_device resolved_name6 "$network_iface6" && \
+			   [ "$resolved_name6" = "$name" ] && \
+			   { ! command -v network_is_up >/dev/null 2>&1 || network_is_up "$network_iface6"; }; then
+				network_get_gateway6 gateway6 "$network_iface6" 2>/dev/null || gateway6=""
+			else
+				logger -t mwan4 "section '$section': IPv6 network '$network_iface6' inactive or L3 device mismatch; IPv6 ECMP disabled on this WAN"
 			fi
 		fi
 		if [ -z "$name" ]; then
@@ -342,11 +419,16 @@ generate_json_config() {
 			up_json="$up_mbps"
 		fi
 
-		local name_json gw_json
+		local name_json gw_json gw6_json
 		name_json="$(json_escape "$name")"
 		gw_json="null"
+		gw6_json="null"
 		if [ -n "$gateway" ] && [ "$gateway" != "0.0.0.0" ]; then
 			gw_json="\"$(json_escape "$gateway")\""
+		fi
+		if [ -n "$gateway6" ] && [ "$gateway6" != "::" ]; then
+			# The Rust --check-config validates the IPv6 address.
+			gw6_json="\"$(json_escape "$gateway6")\""
 		fi
 
 		local target_json=""
@@ -426,6 +508,7 @@ generate_json_config() {
 		    {
 		      "name": "$name_json",
 		      "gateway": $gw_json,
+		      "gateway6": $gw6_json,
 		      "metric": $metric,
 		      "weight": $weight,
 		      "max_mbps": $max_json,
@@ -473,9 +556,15 @@ start_service() {
 		return 0
 	}
 
-	# 产生 JSON 后先 --check-config 自我验证（仅验证不启动）；此时尚未 procd_open_instance，return 1 不会产生重启回圈
+	# Validate before taking a route snapshot or starting the daemon.
 	if ! "$PROG" --check-config "$CONF_FILE"; then
 		logger -t mwan4 "Generated config $CONF_FILE failed --check-config, aborting start"
+		return 1
+	fi
+	# iproute2 is required here; a failed snapshot must never silently
+	# proceed to overwrite the router's only existing default gateway.
+	if ! snapshot_default_routes; then
+		logger -t mwan4 "Refusing to manage routes without a recovery snapshot"
 		return 1
 	fi
 
@@ -490,9 +579,12 @@ start_service() {
 }
 
 _mwan4_netifd_trigger() {
-	local section="$1" network_iface
+	local section="$1" network_iface network_iface6
 	config_get network_iface "$section" network ""
+	config_get network_iface6 "$section" network6 ""
 	[ -n "$network_iface" ] && procd_add_reload_interface_trigger "$network_iface"
+	[ -n "$network_iface6" ] && [ "$network_iface6" != "$network_iface" ] && \
+		procd_add_reload_interface_trigger "$network_iface6"
 }
 
 service_triggers() {

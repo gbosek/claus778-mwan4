@@ -61,3 +61,41 @@ installed nor enabled by this change.
 - Flow offload and hardware acceleration vary by driver; this code does not
   claim hardware ECMP offload.
 - In-progress IPv4 connections may reset when a WAN fails or NAT changes.
+
+## IPv6 automatic gateway (experimental)
+
+Choose a logical `network` interface in LuCI. On a reload, the script uses
+`network_get_gateway6()` to look up the active IPv6 default gateway. For
+OpenWrt configurations with an independent `wan6` interface, set
+`option network6 'wan6'`. IPv6 management is allowed only when its
+resolved L3 device matches the selected IPv4 WAN L3 device. If netifd
+has no gateway, IPv4 remains active and this WAN is excluded from IPv6
+ECMP (the Rust backend requires `gateway6` for multipath).
+
+The Rust daemon still uses IPv4 health probes for IPv6 availability.
+Independent IPv6 health tracking is a separate future enhancement.
+
+## Default-route recovery (experimental)
+
+For a configured/enabled installation, the init script saves the existing
+IPv4 and IPv6 main-table default routes using `ip-full route save` before
+starting the daemon. Snapshots live under `/var/run/mwan4-route-backup`
+and survive procd reloads but not reboots.
+
+On an explicit `/etc/init.d/mwan4 stop`, rc.common calls
+`service_stopped()` **after** killing the daemon. That hook removes only
+the daemon's `proto 77` *default* routes in `main` and restores the
+snapshot with `ip route restore`. No PBR table is flushed.
+
+If no previous default was saved, the script deliberately leaves the
+active route alone to avoid disconnecting an administrator. If restoring
+fails, the snapshot is preserved and a warning logged. As with all route
+restoration, an obsolete gateway after DHCP/PPPoE churn can fail to
+restore; inspect the logged failure and let netifd reacquire the route.
+
+The `stop` hook does not execute during every procd-triggered service
+replacement, and a SIGKILL cannot run Rust shutdown handlers. A future
+iteration must add explicit post-reload recovery and ownership checks.
+
+Package installation must never enable mwan4 automatically. Preserve
+local UCI config on upgrades. Only enable after reviewing chosen WANs.

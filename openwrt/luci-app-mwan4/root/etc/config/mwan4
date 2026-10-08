@@ -17,7 +17,8 @@ config global 'global'
 	option flush_conntrack '1'
 	# 存活成员进出时是否清 conntrack（仅 standard ECMP 生效，主备模式只清新进成员）
 	option flush_conntrack_on_switch '1'
-	# 退出时是否删掉 mwan4 下发的预设路由。预设 0（保留），否则服务重启／升级窗口内整台路由器没有预设路由
+	# 保留内核退出清理的保守默认值；OpenWrt service_stopped 会
+	# 尝试从运行时快照恢复原有的 netifd IPv4/IPv6 默认路由。
 	option remove_routes_on_exit '0'
 	# standard: 单一 multipath 路由，成员/权重一变就重算整张 hash，实测连坐搬走 40%~43% 既有连线（换出口=换 NAT=断线），故非预设
 	# resilient: 内核 nexthop group（Linux 5.14+），只重映射故障成员 bucket（默认延后 120 秒）；auto（预设）优先 resilient，否则退回 standard
@@ -43,6 +44,8 @@ config global 'global'
 # config interface 'uplink'
 #     option enabled '1'
 #     option network 'wan'
+#     # option network6 'wan6'   # optional if IPv6 uses a separate logical iface
+#     # option gateway6 'fe80::1' # normally discovered from netifd
 #     option metric '10'
 #     option weight '1'
 #     list probe_targets '1.1.1.1:53'

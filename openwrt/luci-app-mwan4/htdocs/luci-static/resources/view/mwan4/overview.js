@@ -1220,6 +1220,22 @@ return view.extend({
 		o.rmempty = true;
 		o.editable = true;
 
+		o = s.option(form.ListValue, 'network6', _('IPv6 Logical Interface (optional)'),
+			_('Select a separate IPv6 netifd interface (e.g. wan6) if it shares the same L3 device; otherwise use the IPv4 WAN interface.'));
+		o.value('', _('Same as IPv4 WAN'));
+		uci.sections('network', 'interface').forEach(function(sec) {
+			if (sec['.name'] && sec['.name'] !== 'loopback')
+				o.value(sec['.name'], sec['.name']);
+		});
+		o.rmempty = true;
+		o.editable = true;
+
+		o = s.option(form.Value, 'gateway6', _('IPv6 Gateway (optional)'),
+			_('Normally detected from netifd; only WANs with an IPv6 gateway participate in IPv6 ECMP. Use manual value for advanced setups.'));
+		o.datatype = 'ip6addr';
+		o.rmempty = true;
+		o.editable = true;
+
 		o = s.option(form.Value, 'metric', _('Metric (Priority)'),
 			_('Lower = higher priority. Same metric = ECMP load balancing, different metrics = primary/backup failover.'));
 		o.datatype = 'uinteger';
