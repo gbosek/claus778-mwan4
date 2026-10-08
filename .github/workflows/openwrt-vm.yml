@@ -29,9 +29,37 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install QEMU and virtual WAN test services
+        timeout-minutes: 9
+        env:
+          DEBIAN_FRONTEND: noninteractive
+          NEEDRESTART_MODE: a
         run: |
-          sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 qemu-utils iproute2 dnsmasq-base pppoe ppp python3-pexpect
+          set -euo pipefail
+          mkdir -p /tmp/mwan4-vm-logs
+          # Bound APT and retain its logs: network mirrors can otherwise hang
+          # indefinitely before the guest is even booted.
+          for attempt in 1 2; do
+            echo "APT package index attempt $attempt"
+            if timeout --signal=TERM --kill-after=10s 180s \
+                sudo -E apt-get update -o Acquire::Retries=2 \
+                >/tmp/mwan4-vm-logs/apt-update.log 2>&1; then
+              break
+            fi
+            tail -n 50 /tmp/mwan4-vm-logs/apt-update.log
+            if [ "$attempt" -eq 2 ]; then exit 1; fi
+          done
+          timeout --signal=TERM --kill-after=10s 240s \
+            sudo -E apt-get install -y \
+            -o Dpkg::Options::=--force-confold \
+            -o Acquire::Retries=2 \
+            qemu-system-x86 qemu-utils iproute2 dnsmasq-base pppoe ppp python3-pexpect \
+            >/tmp/mwan4-vm-logs/apt-install.log 2>&1 || {
+              tail -n 120 /tmp/mwan4-vm-logs/apt-install.log
+              exit 1
+            }
+          command -v qemu-system-x86_64
+          command -v pppoe-server
+          python3 -c 'import pexpect; print("pexpect ready")'
       - name: Compile Python VM harness before download
         run: python3 -m py_compile tests/openwrt_vm.py
       - name: Download and verify official OpenWrt x86_64 ext4 disk

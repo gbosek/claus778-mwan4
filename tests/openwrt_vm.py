@@ -35,6 +35,25 @@ class Lab:
         self.services = []
         self.counter = 0
         self.serial = (self.output / "guest-serial.log").open("w", encoding="utf-8")
+        self.checkpoints = (self.output / "checkpoints.log").open("w", encoding="utf-8", buffering=1)
+        self.phase = "host setup"
+
+    def checkpoint(self, message):
+        print(message, flush=True)
+        self.checkpoints.write(message + "\n")
+        self.checkpoints.flush()
+
+    def command_error(self, command, exc):
+        # Preserve the *actual* failed step separately from kernel serial
+        # chatter. The uploaded artifact gives actionable state immediately.
+        text = (
+            f"Phase: {self.phase}\nCommand: {command}\n"
+            f"Exception: {exc}\n"
+            f"QEMU alive: {self.guest is not None and self.guest.isalive()}\n"
+            f"Recent console:\n{self.guest.before[-4000:] if self.guest else 'not launched'}\n"
+        )
+        (self.output / "last-failure.txt").write_text(text, encoding="utf-8")
+        print("GUEST COMMAND FAILURE:\n" + text[-4500:], flush=True)
 
     def server(self, command):
         print("SERVICE:", shlex.join(command), flush=True)
@@ -109,14 +128,18 @@ class Lab:
         self.counter += 1
         marker = f"__MWAN4_RC_{self.counter}_"
         print("GUEST:", command, flush=True)
-        self.guest.sendline(command + f'; rc=$?; printf "\\n{marker}%s\\n" "$rc"')
-        self.guest.expect(re.escape(marker) + r"(\d+)", timeout=timeout)
-        result = self.guest.match.group(1)
-        output = self.guest.before
-        self.guest.expect(r"root@[^:\r\n]+:[^\r\n]*#\s*", timeout=15)
-        if result != "0":
-            raise AssertionError(f"guest rc={result}: {command}\n{output[-2500:]}")
-        return output
+        try:
+            self.guest.sendline(command + f'; rc=$?; printf "\\n{marker}%s\\n" "$rc"')
+            self.guest.expect(re.escape(marker) + r"(\d+)", timeout=timeout)
+            result = self.guest.match.group(1)
+            output = self.guest.before
+            self.guest.expect(r"root@[^:\r\n]+:[^\r\n]*#\s*", timeout=15)
+            if result != "0":
+                raise AssertionError(f"guest rc={result}: {command}\n{output[-2500:]}")
+            return output
+        except (AssertionError, pexpect.TIMEOUT, pexpect.EOF) as exc:
+            self.command_error(command, exc)
+            raise
 
     def wait(self, command, timeout=90):
         deadline, error = time.monotonic() + timeout, ""
@@ -131,6 +154,7 @@ class Lab:
 
     def tests(self):
         # Management interface is QEMU user-net, never a production interface.
+        self.phase = "netifd network interface setup"
         self.wait("pidof netifd >/dev/null", 60)
         # Each UCI command is short enough to survive the BusyBox serial
         # line discipline even while kernel logs are being printed.
@@ -160,6 +184,7 @@ class Lab:
         # before its command result marker is printed.
         self.cmd("(/etc/init.d/network reload >/tmp/mwan4-network-reload.log 2>&1) &")
         self.wait('ubus call network.interface.mgmt status | grep -q \'"up": true\'')
+        self.phase = "management IP and package installation"
         self.cmd("ping -c 1 -W 3 10.0.2.2 >/dev/null")
         # Genuine distro PBR/firewall4 package, not mock nft rule sets.
         self.cmd("opkg update >/tmp/opkg-update.log 2>&1 || "
@@ -178,14 +203,15 @@ class Lab:
         self.cmd('test "$(uci -q get mwan4.global.enabled)" = 0; '
                  '! grep -q "^config interface " /etc/config/mwan4; '
                  '! ip -4 route show table main default proto 77 | grep -q .')
-        print("PASS: no WAN routes installed on first installation", flush=True)
+        self.checkpoint("PASS: no WAN routes installed on first installation")
         self.wait('ubus call network.interface.dhcpwan status | grep -q \'"up": true\'')
+        self.phase = "PPPoE dial"
         self.cmd("ifup pppwan")
         self.wait('ubus call network.interface.pppwan status | grep -q \'"up": true\'', 120)
         self.cmd(". /lib/functions/network.sh; "
                  "network_get_device pppdev pppwan; test -n \"$pppdev\"; "
                  "ip link show \"$pppdev\"")
-        print("PASS: actual PPPoE session established using TAP link", flush=True)
+        self.checkpoint("PASS: actual PPPoE session established using TAP link")
         for key, value in (
             ("global.enabled", "1"),
             ("global.route_priority", "10"),
@@ -201,11 +227,13 @@ class Lab:
         self.cmd("uci add_list mwan4.ppp.probe_targets=100.64.1.1:8093")
         self.cmd("uci add_list mwan4.dhcp.probe_targets=203.0.113.1:8093")
         self.cmd("uci commit mwan4")
+        self.phase = "Rust mwan4 + netifd startup"
         self.cmd("/etc/init.d/mwan4 start")
         self.wait("pidof mwan4 >/dev/null", 45)
         self.cmd("/usr/bin/mwan4 --check-config /var/etc/mwan4.json")
         self.wait("ip -4 route show table main default proto 77 | grep -q .", 65)
-        print("PASS: Rust service running with genuine OpenWrt netifd/procd", flush=True)
+        self.checkpoint("PASS: Rust service running with genuine OpenWrt netifd/procd")
+        self.phase = "PPPoE redial and route rebalance"
         self.cmd("ifdown pppwan")
         self.wait('! ubus call network.interface.pppwan status | grep -q \'"up": true\'', 45)
         self.cmd("ifup pppwan")
@@ -213,7 +241,8 @@ class Lab:
         self.wait("pidof mwan4 >/dev/null", 45)
         self.cmd(". /lib/functions/network.sh; "
                  "network_get_device pppdev pppwan; grep -Fq \"$pppdev\" /var/etc/mwan4.json")
-        print("PASS: PPPoE redial and dynamic L3 interface mapping", flush=True)
+        self.checkpoint("PASS: PPPoE redial and dynamic L3 interface mapping")
+        self.phase = "PBR and firewall4 coexistence"
         for key, value in (
             ("config.enabled", "1"),
             ("config.strict_enforcement", "0"),
@@ -232,19 +261,21 @@ class Lab:
         self.cmd("/etc/init.d/mwan4 reload")
         self.cmd("grep -E 'policy_skip_mark_mask.*[1-9][0-9]*' /var/etc/mwan4.json")
         self.wait("pidof mwan4 >/dev/null", 45)
-        print("PASS: real firewall4 + standalone PBR mark coexistence", flush=True)
+        self.checkpoint("PASS: real firewall4 + standalone PBR mark coexistence")
+        self.phase = "DHCP WAN failover and recovery"
         self.cmd("ifdown dhcpwan")
         self.wait('! ubus call network.interface.dhcpwan status | grep -q \'"up": true\'', 45)
         self.cmd("ifup dhcpwan")
         self.wait('ubus call network.interface.dhcpwan status | grep -q \'"up": true\'', 90)
         self.wait("pidof mwan4 >/dev/null", 45)
-        print("PASS: DHCP WAN offline and reconnect", flush=True)
+        self.checkpoint("PASS: DHCP WAN offline and reconnect")
+        self.phase = "mwan4 shutdown route rollback"
         self.cmd("/etc/init.d/mwan4 stop")
         self.wait("! pidof mwan4 >/dev/null", 35)
         self.cmd("! ip -4 route show table main default proto 77 | grep -q .")
         self.cmd("ip -4 rule show | grep -q fwmark")
         self.cmd("ip -4 route show table main default | grep -q .")
-        print("PASS: OpenWrt guest route rollback keeps PBR and netifd", flush=True)
+        self.checkpoint("PASS: OpenWrt guest route rollback keeps PBR and netifd")
 
     def close(self):
         if self.guest:
@@ -260,6 +291,7 @@ class Lab:
             subprocess.run(["sudo", "ip", "link", "del", "dev", tap],
                            capture_output=True, check=False)
         self.serial.close()
+        self.checkpoints.close()
 
 
 def main():
