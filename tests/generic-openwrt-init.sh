@@ -121,7 +121,7 @@ MOCK_L3="pppoe-wan"
 MOCK_UP=0
 generate_json_config && exit 1 || :
 assert_empty
-# Mock route-save/restore; the test never changes host networking.
+# Route-save/restore mocks never touch host network.
 ROUTE_SNAPSHOT_DIR="$TMP/route-snapshots"
 IP_CALLS="$TMP/ip-calls.txt"
 : > "$IP_CALLS"
@@ -138,7 +138,7 @@ ip() {
         "-4 route restore") return 0 ;;
         "-4 route show table main default" | \
         "-6 route show table main default") return 0 ;;
-        *) echo "unsafe or unexpected ip call: $*" >&2; return 1 ;;
+        *) echo "unexpected route-snapshot ip call: $*" >&2; return 1 ;;
     esac
 }
 snapshot_default_routes
@@ -146,17 +146,17 @@ snapshot_default_routes
 [ -s "$ROUTE_SNAPSHOT_DIR/default6.bin" ]
 restore_default_routes
 grep -q -- '^-4 route flush table main default proto 77$' "$IP_CALLS"
+grep -q -- '^-6 route flush table main default proto 77$' "$IP_CALLS"
 grep -q -- '^-4 route restore$' "$IP_CALLS"
-grep -q -- '^-6 route flush table main default proto 77
 [ ! -e "$ROUTE_SNAPSHOT_DIR/default4.bin" ]
 [ ! -e "$ROUTE_SNAPSHOT_DIR/default6.bin" ]
 
-# Metric preflight: netifd defaults must have higher metrics than mwan4.
+# The metric guard refuses to displace equally/less preferred netifd routes.
 MOCK_BASELINE_METRIC=100
 ip() {
     case "$*" in
         "-4 -o route show table main default")
-            printf 'default via 192.0.2.1 dev eth7 metric %s\n' "$MOCK_BASELINE_METRIC" ;;
+            printf 'default via 192.0.2.1 dev eth7 proto static metric %s\n' "$MOCK_BASELINE_METRIC" ;;
         "-6 route show table main") return 0 ;;
         "-6 -o route show table main default")
             printf 'default via 2001:db8::1 dev eth7 proto ra metric 1024\n' ;;
@@ -165,37 +165,25 @@ ip() {
 }
 verify_default_route_metric 10
 MOCK_BASELINE_METRIC=10
-if verify_default_route_metric 10; then echo "same metric accepted" >&2; exit 1; fi
+if verify_default_route_metric 10; then
+    echo "accepted a same-metric default route" >&2; exit 1
+fi
 MOCK_BASELINE_METRIC=5
-if verify_default_route_metric 10; then echo "lower metric accepted" >&2; exit 1; fi
+if verify_default_route_metric 10; then
+    echo "accepted an existing lower-metric default route" >&2; exit 1
+fi
 MOCK_BASELINE_METRIC=100
 verify_default_route_metric 10
 
-# rc.common must stop old daemon and restore before starting new routing.
+# procd reload must stop the prior daemon and restore before starting again.
 basescript="/etc/init.d/mwan4"
 MOCK_ORDER=""
-procd_kill() { MOCK_ORDER="${MOCK_ORDER}kill:$1 "; }
-restore_default_routes() { MOCK_ORDER="${MOCK_ORDER}restore "; }
-rc_procd() { MOCK_ORDER="${MOCK_ORDER}start:$1"; }
+procd_kill() { MOCK_ORDER="$MOCK_ORDER""kill:$1 "; }
+restore_default_routes() { MOCK_ORDER="$MOCK_ORDER""restore "; }
+rc_procd() { MOCK_ORDER="$MOCK_ORDER""start:$1"; }
 reload_service
 [ "$MOCK_ORDER" = "kill:mwan4 restore start:start_service" ] || {
     echo "unexpected reload order: $MOCK_ORDER" >&2
     exit 1
 }
-echo "PASS: unconfigured, PPPoE, IPv4/IPv6, PBR, metric guard, route snapshots, reload"
- "$IP_CALLS"
-[ ! -e "$ROUTE_SNAPSHOT_DIR/default4.bin" ]
-[ ! -e "$ROUTE_SNAPSHOT_DIR/default6.bin" ]
-
-# rc.common must stop old daemon and restore before starting new routing.
-basescript="/etc/init.d/mwan4"
-MOCK_ORDER=""
-procd_kill() { MOCK_ORDER="${MOCK_ORDER}kill:$1 "; }
-restore_default_routes() { MOCK_ORDER="${MOCK_ORDER}restore "; }
-rc_procd() { MOCK_ORDER="${MOCK_ORDER}start:$1"; }
-reload_service
-[ "$MOCK_ORDER" = "kill:mwan4 restore start:start_service" ] || {
-    echo "unexpected reload order: $MOCK_ORDER" >&2
-    exit 1
-}
-echo "PASS: unconfigured, PPPoE, IPv4/IPv6, policy, route snapshots, reload"
+echo "PASS: empty defaults, PPPoE IPv4/IPv6, policy, safe rollback, metric guard and reload"
