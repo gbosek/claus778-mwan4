@@ -16,6 +16,22 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  generic-openwrt:
+    name: generic defaults / netifd / LuCI syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: POSIX shell syntax
+        run: sh -n openwrt/luci-app-mwan4/root/etc/init.d/mwan4 tests/generic-openwrt-init.sh
+      - name: LuCI JavaScript syntax
+        run: node --check openwrt/luci-app-mwan4/htdocs/luci-static/resources/view/mwan4/overview.js
+      - name: No-WAN and dynamic PPPoE regression tests
+        run: sh tests/generic-openwrt-init.sh
+      - name: No preconfigured WAN in packaged UCI defaults
+        run: |
+          grep -q "^\s*option enabled '0'$" openwrt/luci-app-mwan4/root/etc/config/mwan4
+          ! grep -q "^config interface" openwrt/luci-app-mwan4/root/etc/config/mwan4
+
   # ── 品质关卡：格式、静态检查、单元测试 ────────────────────────────────
   quality:
     name: fmt / clippy / test
