@@ -280,6 +280,13 @@ class Lab:
             self.cmd(f"uci set mwan4.{key}={value}")
         self.cmd("uci add_list mwan4.ppp.probe_targets=100.64.1.1:8093")
         self.cmd("uci add_list mwan4.dhcp.probe_targets=203.0.113.1:8093")
+        # Deliberately overlap native mwan4 source-policy and standalone
+        # PBR. Native rule prefers PPPoE; PBR source match prefers DHCP.
+        # This catches precedence regressions that simple nft existence
+        # tests cannot observe.
+        self.cmd("uci set mwan4.native_ci=policy")
+        self.cmd("uci set mwan4.native_ci.interface=ppp")
+        self.cmd("uci add_list mwan4.native_ci.source=192.0.2.0/24")
         self.cmd("uci commit mwan4")
         self.phase = "Rust mwan4 + netifd startup"
         self.cmd("/etc/init.d/mwan4 start")
@@ -343,6 +350,37 @@ class Lab:
         self.cmd("/etc/init.d/mwan4 reload")
         self.cmd("grep -E 'policy_skip_mark_mask.*[1-9][0-9]*' /var/etc/mwan4.json")
         self.wait("pidof mwan4 >/dev/null", 45)
+        # Both policy systems match 192.0.2.0/24, but only marked flows
+        # should escape the native priority-9000 policy. Extract the
+        # standalone PBR mark for dhcpwan from the LIVE kernel rules.
+        self.phase = "PBR marked/unmarked route precedence"
+        rules = self.cmd("ip -4 rule show")
+        pbr_mark = None
+        for line in rules.splitlines():
+            m = re.search(
+                r"fwmark\s+(0x[0-9a-fA-F]+)/0x[0-9a-fA-F]+"
+                r"\s+lookup\s+(\S+)", line
+            )
+            if m and int(m.group(1), 16) != 0 and "dhcpwan" in m.group(2):
+                pbr_mark = m.group(1)
+                break
+        if pbr_mark is None:
+            raise AssertionError(f"no dhcpwan PBR fwmark rule found:\\n{rules}")
+        self.cmd("ip -4 rule show | grep -q 'from 192.0.2.0/24'")
+        self.cmd("ip -4 rule show | grep -q 'fwmark 0x0/'")
+        marked = self.cmd(
+            f"ip -4 route get 198.18.0.1 from 192.0.2.10 mark {pbr_mark}"
+        )
+        if not re.search(r"\bdev eth2\b", marked):
+            raise AssertionError(f"marked PBR traffic did not select dhcpwan: {marked}")
+        unmarked = self.cmd(
+            "ip -4 route get 198.18.0.1 from 192.0.2.10"
+        )
+        if not re.search(r"\bdev ppp[^\s]*\b", unmarked):
+            raise AssertionError(
+                f"unmarked traffic did not retain PPPoE native policy: {unmarked}"
+            )
+        self.checkpoint("PASS: overlapping PBR mark beats native policy, unmarked stays PPPoE")
         self.checkpoint("PASS: real firewall4 + standalone PBR mark coexistence")
         self.phase = "DHCP WAN failover and recovery"
         self.cmd("ifdown dhcpwan")
