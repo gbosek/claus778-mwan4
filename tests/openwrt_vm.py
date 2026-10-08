@@ -312,16 +312,32 @@ class Lab:
         for key, value in (
             ("config.enabled", "1"),
             ("config.strict_enforcement", "0"),
+            # PBR defaults to the literal logical WAN 'wan', which does not
+            # exist in this generic-netifd test. Point it at the NAT-enabled
+            # mgmt interface with a real reachable IPv4 gateway.
+            ("config.uplink_interface", "mgmt"),
             ("mwan4_ci", "policy"),
             ("mwan4_ci.name", "CI_DHCP_WAN"),
             ("mwan4_ci.src_addr", "192.0.2.0/24"),
             ("mwan4_ci.interface", "dhcpwan"),
         ):
             self.cmd(f"uci set pbr.{key}={value}")
+        # dhcpwan does not match PBR's built-in 'wan*' naming heuristic.
+        # Explicitly opt in without altering any router-wide defaults.
+        self.cmd("uci add_list pbr.config.supported_interface=dhcpwan")
+        self.cmd("uci add_list pbr.config.supported_interface=pppwan")
         self.cmd("uci commit pbr")
         self.cmd("/etc/init.d/firewall restart", 80)
         self.cmd("/etc/init.d/pbr restart", 95)
-        self.wait("ip -4 rule show | grep -q fwmark", 55)
+        try:
+            self.wait("ip -4 rule show | grep -q fwmark", 55)
+        except (AssertionError, pexpect.TIMEOUT):
+            self.cmd("uci show pbr.config")
+            self.cmd("ubus call network.interface.mgmt status")
+            self.cmd("ubus call network.interface.dhcpwan status")
+            self.cmd("ip -4 rule show")
+            self.cmd("logread -e pbr")
+            raise
         self.cmd("fw4 print >/tmp/mwan4-fw4.nft; test -s /tmp/mwan4-fw4.nft")
         self.cmd("nft list ruleset | grep -q pbr")
         self.cmd("/etc/init.d/mwan4 reload")
