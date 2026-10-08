@@ -94,7 +94,11 @@ class Lab:
         ], timeout=145)
         self.guest.sendline("")
         self.guest.expect(r"root@[^:\r\n]+:[^\r\n]*#\s*", timeout=35)
-        self.cmd("cat /etc/openwrt_release; ip -br link; uci show network")
+        # Fresh OpenWrt ext4 images can have no UCI network file before
+        # firstboot scripts finish. BusyBox's built-in ip lacks '-br'.
+        self.cmd("cat /etc/openwrt_release; ip link show; "
+                 "mkdir -p /etc/config; touch /etc/config/network; "
+                 "uci -q show network || true")
 
     def cmd(self, command, timeout=80):
         self.counter += 1
