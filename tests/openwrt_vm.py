@@ -155,12 +155,21 @@ class Lab:
             self.command_error(command, exc)
             raise
 
-    def dump_routing_diagnostics(self):
+    def dump_routing_diagnostics(self, pbr_mark=None):
         self.cmd(
             "ip -4 rule show; ip -4 route show table all; "
             "nft list ruleset || true",
             timeout=60,
         )
+        if pbr_mark:
+            for command in (
+                f"ip -4 route get 198.18.0.1 mark {pbr_mark} || true",
+                "ip -4 route get 198.18.0.1 from 192.0.2.10 || true",
+                "ip -4 route get 198.18.0.1 from 203.0.113.46 "
+                f"mark {pbr_mark} || true",
+                f"ip -4 route get fibmatch 198.18.0.1 mark {pbr_mark} || true",
+            ):
+                self.cmd(command, timeout=30)
 
     def guest_job(self, command, name, timeout=120):
         """Run a long operation asynchronously without GNU timeout in guest.
@@ -396,7 +405,7 @@ class Lab:
                 "ip -4 rule show | grep -Eq 'fwmark (0x)?0(/|[[:space:]]|$)|not fwmark'"
             )
         except (AssertionError, pexpect.TIMEOUT, pexpect.EOF):
-            self.dump_routing_diagnostics()
+            self.dump_routing_diagnostics(pbr_mark)
             raise
         try:
             marked = self.cmd(
@@ -407,7 +416,7 @@ class Lab:
                     f"marked PBR traffic did not select dhcpwan: {marked}"
                 )
         except (AssertionError, pexpect.TIMEOUT, pexpect.EOF):
-            self.dump_routing_diagnostics()
+            self.dump_routing_diagnostics(pbr_mark)
             raise
         try:
             unmarked = self.cmd(
@@ -419,7 +428,7 @@ class Lab:
                     f"{unmarked}"
                 )
         except (AssertionError, pexpect.TIMEOUT, pexpect.EOF):
-            self.dump_routing_diagnostics()
+            self.dump_routing_diagnostics(pbr_mark)
             raise
         self.checkpoint("PASS: overlapping PBR mark beats native policy, unmarked stays PPPoE")
         self.checkpoint("PASS: real firewall4 + standalone PBR mark coexistence")
