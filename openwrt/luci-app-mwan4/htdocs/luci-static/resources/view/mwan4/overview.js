@@ -253,7 +253,7 @@ function rateText(iface) {
 	var text = '\u2191 ' + formatRate(iface.tx_bps) + '  \u2193 ' + formatRate(iface.rx_bps);
 	if (iface.load_pct !== undefined && iface.load_pct !== null) {
 		text += '  (' + iface.load_pct.toFixed(0) + '%';
-		if (iface.offloaded) text += ', ' + _('offloaded');
+		if (iface.load_shifted) text += ', ' + _('load shifting');
 		text += ')';
 	}
 	return text;
