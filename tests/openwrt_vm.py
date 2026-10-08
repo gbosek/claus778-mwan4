@@ -43,6 +43,7 @@ class Lab:
     def __init__(self, args):
         self.image = pathlib.Path(args.image).resolve()
         self.kernel = pathlib.Path(args.kernel).resolve()
+        self.distro = args.distro
         self.payload = pathlib.Path(args.payload).resolve()
         self.output = pathlib.Path(args.output).resolve()
         self.output.mkdir(parents=True, exist_ok=True)
@@ -191,6 +192,15 @@ class Lab:
     def tests(self):
         # Management interface is QEMU user-net, never a production interface.
         self.phase = "netifd network interface setup"
+        if self.distro == "immortalwrt":
+            # A real ImmortalWrt 6.18.52 guest must pass these checks;
+            # running the 24.10 userland in its place is not acceptable.
+            self.cmd("uname -r | grep -qx 6.18.52")
+            self.cmd("grep -qi ImmortalWrt /etc/openwrt_release")
+            self.cmd("command -v apk >/dev/null")
+            self.checkpoint("PASS: genuine ImmortalWrt 6.18.52 kernel + APK userland")
+        else:
+            self.cmd("command -v opkg >/dev/null")
         self.wait("pidof netifd >/dev/null", 60)
         # Each UCI command is short enough to survive the BusyBox serial
         # line discipline even while kernel logs are being printed.
@@ -235,10 +245,17 @@ class Lab:
         # Genuine distro PBR/firewall4 package, not mock nft rule sets.
         # OpenWrt base BusyBox lacks the 'timeout' applet. Poll a background
         # ash job with a host-side deadline so no GNU binaries are assumed.
-        self.guest_job("opkg update", "opkg-update", timeout=140)
-        self.guest_job("opkg install ppp ppp-mod-pppoe ip-full nftables-json pbr",
-                       "opkg-install", timeout=170)
-        self.checkpoint("PASS: actual OpenWrt package feeds and PBR packages")
+        if self.distro == "immortalwrt":
+            # Linux 6.18 snapshots use APK, unlike OpenWrt 24.10's opkg.
+            # No opkg fallback: exercising the real package manager matters.
+            self.guest_job("apk update", "apk-update", timeout=140)
+            self.guest_job("apk add ppp ppp-mod-pppoe ip-full nftables-json pbr",
+                           "apk-install", timeout=170)
+        else:
+            self.guest_job("opkg update", "opkg-update", timeout=140)
+            self.guest_job("opkg install ppp ppp-mod-pppoe ip-full nftables-json pbr",
+                           "opkg-install", timeout=170)
+        self.checkpoint("PASS: real distro package manager and PBR dependencies")
         self.cmd("mkdir -p /usr/libexec /etc/config; "
                  "wget -qO /usr/bin/mwan4 http://10.0.2.2:8093/mwan4; "
                  "chmod 755 /usr/bin/mwan4")
@@ -418,6 +435,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--image", required=True)
     p.add_argument("--kernel", required=True)
+    p.add_argument("--distro", choices=("openwrt", "immortalwrt"), default="openwrt")
     p.add_argument("--payload", required=True)
     p.add_argument("--output", required=True)
     args = p.parse_args()
