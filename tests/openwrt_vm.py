@@ -288,7 +288,21 @@ class Lab:
         if self.distro == "immortalwrt":
             # Linux 6.18 snapshots use APK, unlike OpenWrt 24.10's opkg.
             # No opkg fallback: exercising the real package manager matters.
-            self.guest_job("apk update", "apk-update", timeout=140)
+            # Snapshot mirrors can briefly truncate one index while the
+            # remaining feeds are usable. Retry the refresh; if a nonrequired
+            # feed stays unavailable, apk add below still verifies that the
+            # PBR dependencies needed by this test can actually be installed.
+            self.guest_job(
+                "for attempt in 1 2 3; do "
+                "echo \"apk update attempt $attempt\"; "
+                "apk update && exit 0; "
+                "[ \"$attempt\" -eq 3 ] || sleep 3; "
+                "done; "
+                "echo 'WARNING: snapshot feed refresh incomplete; checking required packages with apk add'",
+                "apk-update",
+                timeout=200,
+            )
+            self.cmd("tail -n 20 /tmp/mwan4-apk-update.log")
             self.guest_job("apk add ppp ppp-mod-pppoe ip-full nftables-json pbr",
                            "apk-install", timeout=170)
         else:
