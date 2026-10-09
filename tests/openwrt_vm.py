@@ -293,12 +293,8 @@ class Lab:
             # feed stays unavailable, apk add below still verifies that the
             # PBR dependencies needed by this test can actually be installed.
             self.guest_job(
-                "for attempt in 1 2 3; do "
-                "echo \"apk update attempt $attempt\"; "
-                "apk update && exit 0; "
-                "[ \"$attempt\" -eq 3 ] || sleep 3; "
-                "done; "
-                "echo 'WARNING: snapshot feed refresh incomplete; checking required packages with apk add'",
+                "i=0; while [ $i -lt 3 ] && ! apk update; "
+                "do i=$((i+1)); sleep 2; done",
                 "apk-update",
                 timeout=200,
             )
