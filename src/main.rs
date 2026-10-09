@@ -69,7 +69,10 @@ OPTIONS:
 fn warn_on_metric_tiers(config: &DaemonConfig) {
     let mut tiers = std::collections::BTreeMap::<u32, Vec<&str>>::new();
     for iface in &config.interfaces {
-        tiers.entry(iface.metric).or_default().push(iface.name.as_str());
+        tiers
+            .entry(iface.metric)
+            .or_default()
+            .push(iface.name.as_str());
     }
 
     if tiers.len() < 2 {
