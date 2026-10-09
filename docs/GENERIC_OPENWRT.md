@@ -39,25 +39,20 @@ handing policies to Rust. Old configurations directly naming an interface
 device remain supported. A policy pointing at an inactive configured logical
 WAN is deferred until that WAN comes online.
 
-## PBR (optional; NOT yet integrated)
+## PBR (optional)
 
-Existing OpenWrt PBR integration is specific to **mossdef's** mwan4 ucode/nft
-API, not the claus778 Rust ECMP daemon. Do not enable their integration
-against this backend without an adapter: it expects mark chains and
-`require('mwan4')` that this backend does not provide.
-
-A future optional adapter can leave unmatched traffic on native ECMP and
-send only selected policies into separate routing tables. PBR is neither
-installed nor enabled by this change.
+Standalone distro PBR is supported with optional mark exclusion. The optional
+`mwan4-pbr-compat` adapter also offers an explicit IPv4 consumer mode for
+mossdef PBR 1.2.3, exposing balanced and preferred-WAN targets while keeping
+Rust health management and FIB/ECMP routing. See [configuration and limits](PBR_COMPAT.md).
 
 ## Safety and open issues
 
 - `remove_routes_on_exit=0` is upstream's conservative default: stopping an
   already active daemon does **not** guarantee automatic restoration of the
   pre-mwan4 default route. Inspect `ip route` before/after rollback.
-- This change does not implement IPv6 dynamic gateway discovery, since the
-  upstream UCI generator does not yet export `gateway6`. Do not assume
-  dual-WAN IPv6 works until it has been separately integrated and tested.
+- IPv6 gateway discovery is supported as described below. Independent IPv6
+  health and integrated PBR IPv6 targets still require separate development.
 - Flow offload and hardware acceleration vary by driver; this code does not
   claim hardware ECMP offload.
 - In-progress IPv4 connections may reset when a WAN fails or NAT changes.

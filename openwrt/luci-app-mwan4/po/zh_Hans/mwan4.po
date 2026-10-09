@@ -226,3 +226,15 @@ msgstr "合计速率"
 
 msgid "RTT Trend"
 msgstr "RTT 趋势"
+
+msgid "PBR Integration"
+msgstr "PBR 集成"
+
+msgid "Standalone PBR (default)"
+msgstr "独立 PBR（默认）"
+
+msgid "PBR strategy targets (IPv4)"
+msgstr "PBR 策略组目标（IPv4）"
+
+msgid "Optional. Strategy targets require mwan4-pbr-compat and PBR 1.2.3 with IPv6 policies disabled. Configure domain, port and device matches in PBR."
+msgstr "可选功能。策略组目标需要 mwan4-pbr-compat 和 PBR 1.2.3，并关闭 PBR 的 IPv6 策略。在 PBR 中配置域名、端口及设备匹配条件。"

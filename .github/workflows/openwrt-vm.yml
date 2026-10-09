@@ -126,6 +126,13 @@ jobs:
           cp openwrt/luci-app-mwan4/root/etc/init.d/mwan4 /tmp/mwan4-vm-payload/mwan4-init
           cp openwrt/luci-app-mwan4/root/etc/config/mwan4 /tmp/mwan4-vm-payload/mwan4-uci
           cp openwrt/mwan4-pbr-compat/files/usr/libexec/mwan4-pbr-compat /tmp/mwan4-vm-payload/pbr-compat
+          tar -cf /tmp/mwan4-vm-payload/pbr-adapter.tar -C openwrt/mwan4-pbr-compat/files lib/mwan4
+      - name: Stage pinned upstream PBR consumer API for strategy regression
+        run: |
+          git init /tmp/mwan4-pbr-upstream
+          git -C /tmp/mwan4-pbr-upstream fetch --depth 1 https://github.com/mossdef-org/pbr.git d462378320e5ae88dfe475964faa16f80f5f70cd
+          git -C /tmp/mwan4-pbr-upstream checkout --detach FETCH_HEAD
+          tar -cf /tmp/mwan4-vm-payload/pbr-1.2.3.tar -C /tmp/mwan4-pbr-upstream/files etc/init.d/pbr lib/pbr
       - name: Boot ${{ matrix.label }} and execute integration regression
         timeout-minutes: 22
         run: |

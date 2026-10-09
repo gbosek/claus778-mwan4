@@ -1,4 +1,7 @@
 config global 'global'
+	# Optional PBR 1.2.3 consumer API: standalone (default) or mossdef.
+	# Requires mwan4-pbr-compat; see docs/PBR_COMPAT.md before enabling.
+	option pbr_mode 'standalone'
 	option enabled '0'
 	# Must be strictly lower than the metrics of netifd-installed default
 	# routes on participating WANs; start is refused on conflicts.

@@ -723,6 +723,8 @@ fn netns_policy_routing() {
         source: Some(("192.168.9.0".parse().unwrap(), 24)),
         destination: None,
         skip_mark_mask: None,
+        match_mark: None,
+        suppress_default: false,
     };
     rm.set_policy_rules(std::slice::from_ref(&rule))
         .expect("install policy rule");
@@ -793,6 +795,8 @@ fn netns_policy_routing() {
         source: Some(("192.168.9.0".parse().unwrap(), 24)),
         destination: Some(("203.0.113.0".parse().unwrap(), 24)),
         skip_mark_mask: None,
+        match_mark: None,
+        suppress_default: false,
     };
     rm.set_policy_rules(&[rule.clone(), scoped.clone()])
         .expect("install scoped policy rule");
@@ -817,8 +821,10 @@ fn netns_policy_routing() {
         source: Some(("192.168.8.0".parse().unwrap(), 24)),
         destination: None,
         skip_mark_mask: None,
+        match_mark: None,
+        suppress_default: false,
     };
-    rm.set_policy_rules(&[rule, additional_rule])
+    rm.set_policy_rules(&[rule.clone(), additional_rule])
         .expect("install two rules on the same priority");
     let rules = sh_out(&["ip", "rule", "show"]);
     assert!(rules.contains("192.168.9.0/24") && rules.contains("192.168.8.0/24"));
@@ -828,6 +834,67 @@ fn netns_policy_routing() {
         !rules.contains("192.168.9.0/24") && !rules.contains("192.168.8.0/24"),
         "sweep left behind same-priority policy rule(s):\n{rules}"
     );
+
+    // The PBR consumer mark must beat an overlapping native source policy.
+    // Specific main routes (LAN/VPN/connected) are protected from a WAN default.
+    assert!(sh(&["ip", "route", "add", "default", "dev", "mwp0"]));
+    let target = PolicyRule {
+        name: "pbr:preferred".into(),
+        priority: PBR_RULE_PRIORITY_BASE + 1,
+        source: None,
+        match_mark: Some((0x100, PBR_MARK_MASK)),
+        ..rule.clone()
+    };
+    let connected = PolicyRule {
+        priority: PBR_RULE_PRIORITY_BASE,
+        table: 254,
+        suppress_default: true,
+        ..target.clone()
+    };
+    rm.set_policy_rules(&[rule.clone(), connected.clone(), target.clone()])
+        .unwrap();
+    let marked = sh_out(&[
+        "ip",
+        "route",
+        "get",
+        "8.8.8.8",
+        "from",
+        "192.168.9.5",
+        "mark",
+        "0x40000100",
+    ]);
+    assert!(
+        marked.contains("dev mwp1"),
+        "preferred WAN failed: {marked}"
+    );
+    let lan = sh_out(&["ip", "route", "get", "10.20.0.1", "mark", "0x100"]);
+    assert!(
+        lan.contains("dev mwp0"),
+        "connected route stolen by WAN table: {lan}"
+    );
+    let fallback = PolicyRule {
+        table: 254,
+        ..target
+    };
+    rm.set_policy_rules(&[rule, connected, fallback]).unwrap();
+    let down = sh_out(&[
+        "ip",
+        "route",
+        "get",
+        "8.8.8.8",
+        "from",
+        "192.168.9.5",
+        "mark",
+        "0x100",
+    ]);
+    assert!(
+        down.contains("dev mwp0"),
+        "PBR fallback fell into native policy: {down}"
+    );
+    // A stale marked rule after a daemon crash is swept by protocol and band.
+    rm.sweep_policy_rules().unwrap();
+    assert!(!sh_out(&["ip", "rule", "show"]).contains("fwmark 0x100/0x3f00"));
+    assert!(sh(&["ip", "route", "del", "default", "dev", "mwp0"]));
 
     // FIX-8：auto 模式必须回报「实际安装生效的变体」，主回圈才能正确决定
     // 要不要在切换瞬间清 conntrack（不能只看设定值）。

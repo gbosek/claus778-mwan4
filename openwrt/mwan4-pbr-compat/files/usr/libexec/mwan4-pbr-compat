@@ -8,12 +8,14 @@ warn() { printf 'WARN: %s\n' "$*" >&2; }
 has_service() { [ -x /etc/init.d/pbr ] && [ -f /etc/config/pbr ]; }
 pbr_value() { uci -q get "pbr.config.$1" 2>/dev/null || :; }
 check() {
-	local failed=0 strict nstrict
+	local failed=0 strict nstrict mode
 	if ! has_service; then
 		say "PBR is not installed; ECMP operates independently."
 		return 0
 	fi
-	say "PBR is installed; use its standalone OpenWrt routing mode."
+	mode="$(uci -q get mwan4.global.pbr_mode 2>/dev/null || :)"
+	[ -n "$mode" ] || mode=standalone
+	say "PBR routing mode: $mode"
 	if [ "$(pbr_value enabled)" != "1" ]; then
 		say "PBR is disabled. Unmatched traffic uses ECMP."
 		return 0
@@ -22,11 +24,20 @@ check() {
 		warn "nft and ip-full are required for PBR route verification"
 		failed=1
 	fi
-	# mossdef-specific synthetic targets require ucode strategy chains,
-	# which do not exist in claus778's Rust/FIB backend.
-	if uci -q show pbr 2>/dev/null | grep -Eq "mwan4_strategy_|mwan4:strategy:"; then
-		warn "mossdef-specific PBR strategy target detected; choose ordinary WAN interfaces instead"
+	if [ "$mode" != mossdef ] && uci -q show pbr 2>/dev/null | grep -Eq "mwan4_strategy_|mwan4:strategy:"; then
+		warn "Strategy targets require global.pbr_mode=mossdef and PBR 1.2.3"
 		failed=1
+	fi
+	if [ "$mode" = mossdef ]; then
+		if [ ! -f /lib/pbr/platform.uc ] || [ ! -s /var/etc/mwan4-pbr.json ]; then
+			warn "PBR 1.2.3 and an active adapter manifest are required; reload mwan4 first"
+			failed=1
+		fi
+		if [ "$(pbr_value ipv6_enabled)" = 1 ]; then
+			warn "Integrated strategy targets currently support IPv4 only"
+			failed=1
+		fi
+		say "Targets: balanced and <logical-WAN>_prefer; failed preferred WANs fall back to ECMP."
 	fi
 	strict="$(pbr_value strict_enforcement)"
 	nstrict="$(pbr_value netifd_strict_enforcement)"
@@ -37,7 +48,7 @@ check() {
 		warn "PBR netifd strict enforcement can alter default routing; verify it does not override ECMP"
 	fi
 	if [ "$failed" = 0 ]; then
-		say "Basic check passed: marked PBR flows bypass native policies; unmatched flows retain FIB/ECMP."
+		say "Configuration check passed; verify live packet routing with status and WAN failure tests."
 	else
 		warn "PBR compatibility check found blocking problems."
 	fi

@@ -299,11 +299,11 @@ class Lab:
                 timeout=200,
             )
             self.cmd("tail -n 20 /tmp/mwan4-apk-update.log")
-            self.guest_job("apk add ppp ppp-mod-pppoe ip-full nftables-json pbr",
+            self.guest_job("apk add ppp ppp-mod-pppoe ip-full nftables-json pbr ucode-mod-uci ucode-mod-ubus",
                            "apk-install", timeout=170)
         else:
             self.guest_job("opkg update", "opkg-update", timeout=140)
-            self.guest_job("opkg install ppp ppp-mod-pppoe ip-full nftables-json pbr",
+            self.guest_job("opkg install ppp ppp-mod-pppoe ip-full nftables-json pbr ucode-mod-uci ucode-mod-ubus",
                            "opkg-install", timeout=170)
         self.checkpoint("PASS: real distro package manager and PBR dependencies")
         self.cmd("mkdir -p /usr/libexec /etc/config; "
@@ -472,13 +472,37 @@ class Lab:
             raise
         self.checkpoint("PASS: overlapping PBR mark beats native policy, unmarked stays PPPoE")
         self.checkpoint("PASS: real firewall4 + standalone PBR mark coexistence")
+        self.phase = "PBR 1.2.3 consumer strategy API"
+        self.cmd("/etc/init.d/pbr stop")
+        self.cmd("wget -qO /tmp/pbr-adapter.tar http://10.0.2.2:8093/pbr-adapter.tar")
+        self.cmd("tar -xf /tmp/pbr-adapter.tar -C /")
+        self.cmd("wget -qO /tmp/pbr-1.2.3.tar http://10.0.2.2:8093/pbr-1.2.3.tar")
+        self.cmd("tar -xf /tmp/pbr-1.2.3.tar -C /; chmod 755 /etc/init.d/pbr")
+        for key, value in (("mwan4.global.pbr_mode", "mossdef"),
+                           ("pbr.config.ipv6_enabled", "0"),
+                           ("pbr.mwan4_ci.interface", "mwan4_strategy_dhcpwan_prefer")):
+            self.cmd(f"uci set {key}={value}")
+        self.cmd("uci commit mwan4; uci commit pbr; /etc/init.d/mwan4 reload", 95)
+        self.wait("ip -4 rule show | grep -q 'fwmark 0x200/0x3f00 lookup 10001'", 60)
+        self.cmd("/etc/init.d/pbr restart", 95)
+        self.cmd("/usr/libexec/mwan4-pbr-compat check")
+        self.cmd("nft list ruleset | grep -q 'goto mwan4_strategy_dhcpwan_prefer_ipv4'")
+        self.cmd("ip -4 route get 198.18.0.1 from 192.0.2.10 mark 0x200 | grep -q 'table 10001'")
+        self.cmd("/etc/init.d/firewall reload", 40)
+        self.cmd("nft list ruleset | grep -q 'goto mwan4_strategy_dhcpwan_prefer_ipv4'")
+        self.checkpoint("PASS: actual upstream PBR 1.2.3 strategy target and fw4 reload")
         self.phase = "DHCP WAN failover and recovery"
         self.cmd("ifdown dhcpwan")
         self.wait('! ubus call network.interface.dhcpwan status | grep -q \'"up": true\'', 45)
+        self.wait("ip -4 rule show | grep -q 'fwmark 0x200/0x3f00 lookup main'", 60)
+        self.cmd("ip -4 route get 198.18.0.1 from 192.0.2.10 mark 0x200 | grep -q 'dev pppoe-pppwan'")
         self.cmd("ifup dhcpwan")
         self.wait('ubus call network.interface.dhcpwan status | grep -q \'"up": true\'', 90)
         self.wait("pidof mwan4 >/dev/null", 45)
+        self.wait("ip -4 rule show | grep -q 'fwmark 0x200/0x3f00 lookup 10001'", 60)
+        self.cmd("ip -4 route get 198.18.0.1 from 192.0.2.10 mark 0x200 | grep -q 'table 10001'")
         self.checkpoint("PASS: DHCP WAN offline and reconnect")
+        self.checkpoint("PASS: PBR preferred WAN falls back to ECMP and recovers")
         self.phase = "mwan4 shutdown route rollback"
         self.cmd("/etc/init.d/mwan4 stop")
         try:
@@ -493,6 +517,7 @@ class Lab:
             raise
         self.cmd("! ip -4 route show table main default proto 77 | grep -q .")
         self.cmd("ip -4 rule show | grep -q fwmark")
+        self.cmd("! ip -4 rule show | grep -q '/0x3f00'")
         self.cmd("ip -4 route show table main default | grep -q .")
         self.checkpoint("PASS: OpenWrt guest route rollback keeps PBR and netifd")
 
@@ -525,6 +550,17 @@ def main():
     try:
         lab.start()
         lab.tests()
+    except Exception:
+        if lab.guest is not None and lab.guest.isalive():
+            try:
+                lab.dump_routing_diagnostics()
+                lab.cmd("logread -e pbr || true")
+                lab.cmd("logread -e mwan4 || true")
+                lab.cmd("cat /var/etc/mwan4-pbr.json 2>/dev/null || true")
+                lab.cmd("cat /var/etc/mwan4-pbr/reload.log 2>/dev/null || true")
+            except Exception as diagnostic_error:
+                print(f"Additional diagnostics failed: {diagnostic_error}", flush=True)
+        raise
     finally:
         lab.close()
 

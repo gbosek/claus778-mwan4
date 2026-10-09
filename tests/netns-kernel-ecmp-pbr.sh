@@ -58,6 +58,20 @@ marked="$(ip -n "$ns" -4 route get 8.8.8.8 from 192.0.2.2 mark 0x10000)"
 printf '%s\n' "$marked" | grep -q 'dev wan_b'
 unmarked="$(ip -n "$ns" -4 route get 8.8.8.8 from 192.0.2.2)"
 printf '%s\n' "$unmarked" | grep -q 'dev wan_a'
+# Optional real nft batch emitted by our ucode renderer. Exercise a packet
+# through the PBR-consumer goto chain and preserve an unrelated mark bit.
+if [ -n "${1:-}" ]; then
+    ip netns exec "$ns" nft add table inet fw4
+    ip netns exec "$ns" nft -f "$1"
+    ip netns exec "$ns" nft -f "$1" # idempotent firewall reload
+    ip netns exec "$ns" nft add chain inet fw4 pbr_test_output '{ type route hook output priority mangle; policy accept; }'
+    ip netns exec "$ns" nft add rule inet fw4 pbr_test_output ip daddr 203.0.113.1 meta mark set 0x40000000 goto mwan4_strategy_unicom_prefer_ipv4
+    ip netns exec "$ns" nft add chain inet fw4 pbr_test_check '{ type filter hook postrouting priority filter; policy accept; }'
+    ip netns exec "$ns" nft add rule inet fw4 pbr_test_check meta mark 0x40000200 oifname wan_b counter
+    ip netns exec "$ns" ping -c 1 -W 2 203.0.113.1 >/dev/null
+    ip netns exec "$ns" nft list chain inet fw4 pbr_test_check | grep -q 'counter packets 1'
+    echo "PASS: actual nft consumer packet, unrelated mark preserved, idempotent reload"
+fi
 # Removing only proto-77 default routes MUST NOT touch PBR's table 201/rule.
 ip -n "$ns" -4 route flush table main default proto 77
 ip -n "$ns" -6 route flush table main default proto 77

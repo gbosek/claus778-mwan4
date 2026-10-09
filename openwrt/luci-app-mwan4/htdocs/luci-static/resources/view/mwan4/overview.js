@@ -1147,6 +1147,13 @@ return view.extend({
 		o.default = 'auto';
 		o.rmempty = false;
 
+		o = s.taboption('advanced', form.ListValue, 'pbr_mode', _('PBR Integration'),
+			_('Optional. Strategy targets require mwan4-pbr-compat and PBR 1.2.3 with IPv6 policies disabled. Configure domain, port and device matches in PBR.'));
+		o.value('standalone', _('Standalone PBR (default)'));
+		o.value('mossdef', _('PBR strategy targets (IPv4)'));
+		o.default = 'standalone';
+		o.rmempty = false;
+
 		o = s.taboption('advanced', form.Value, 'degrade_loss_threshold', _('Degrade Loss Threshold'));
 		o.default = '0.2';
 		o.rmempty = false;

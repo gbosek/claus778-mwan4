@@ -126,7 +126,27 @@ restore_default_routes() {
 }
 
 service_stopped() {
+	# SIGKILL cannot run Rust's shutdown cleanup. Clear only adapter rules
+	# carrying our protocol marker in our reserved band; never flush PBR's
+	# standalone rules. Keep nft chains so existing PBR goto targets stay valid.
+	if [ -f "$CONF_DIR/mwan4-pbr.json" ]; then
+		local priorities priority
+		priorities="$(ip -4 rule show protocol 77 2>/dev/null | awk -F: '$1>=8000 && $1<8126 {print $1}')"
+		for priority in $priorities; do
+			ip -4 rule del pref "$priority" protocol 77 || logger -t mwan4 "Could not remove adapter rule $priority"
+		done
+	fi
 	restore_default_routes
+}
+
+service_started() {
+	local pbr_mode
+	config_get pbr_mode global pbr_mode standalone
+	if [ "$pbr_mode" = mossdef ] && [ -x /etc/init.d/pbr ]; then
+		# PBR starts earlier at boot. Publish consumer chains/manifest first,
+		# then ask enabled PBR to resolve its targets against the new mapping.
+		(/etc/init.d/pbr reload > "$CONF_DIR/mwan4-pbr/reload.log" 2>&1) &
+	fi
 }
 
 # rc.common's default procd reload calls start_service() directly; it does
@@ -641,6 +661,24 @@ generate_json_config() {
 	}
 	EOF
 
+	local pbr_mode
+	config_get pbr_mode global pbr_mode standalone
+	case "$pbr_mode" in
+		standalone) ;;
+		mossdef)
+			if [ ! -f /lib/mwan4/pbr-prepare.uc ] || ! command -v ucode >/dev/null 2>&1; then
+				logger -t mwan4 "mossdef PBR mode requires the optional mwan4-pbr-compat package"
+				return 1
+			fi
+			# Private runtime state, never inherit symlinks in a shared /tmp.
+			mkdir -p "$CONF_DIR/mwan4-pbr" || return 1
+			chmod 700 "$CONF_DIR/mwan4-pbr" || return 1
+			ucode -S -L /lib/mwan4 /lib/mwan4/pbr-prepare.uc \
+				"$CONF_FILE" "$CONF_DIR/mwan4-pbr/manifest.json" "$CONF_DIR/mwan4-pbr/rules.nft" || return 1
+			;;
+		*) logger -t mwan4 "Unknown pbr_mode '$pbr_mode'"; return 1 ;;
+	esac
+
 	return 0
 }
 
@@ -674,6 +712,20 @@ start_service() {
 	if ! snapshot_default_routes; then
 		logger -t mwan4 "Refusing to manage routes without a recovery snapshot"
 		return 1
+	fi
+
+	local pbr_mode
+	config_get pbr_mode global pbr_mode standalone
+	if [ "$pbr_mode" = mossdef ]; then
+		# nft batches are atomic. The same idempotent batch survives fw4
+		# reloads before PBR's 30-pbr.nft is loaded. PBR owns its match rules.
+		if ! nft -f "$CONF_DIR/mwan4-pbr/rules.nft"; then
+			logger -t mwan4 "PBR adapter nft batch failed; daemon was not started"
+			return 1
+		fi
+		mkdir -p /usr/share/nftables.d/ruleset-post || return 1
+		cp "$CONF_DIR/mwan4-pbr/rules.nft" /usr/share/nftables.d/ruleset-post/25-mwan4-pbr.nft || return 1
+		cp "$CONF_DIR/mwan4-pbr/manifest.json" "$CONF_DIR/mwan4-pbr.json" || return 1
 	fi
 
 	procd_open_instance
