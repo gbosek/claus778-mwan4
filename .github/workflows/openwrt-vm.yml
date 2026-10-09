@@ -67,6 +67,7 @@ jobs:
           done
           timeout --signal=TERM --kill-after=10s 240s \
             sudo -E apt-get install -y \
+            --no-install-recommends \
             -o Dpkg::Options::=--force-confold \
             -o Acquire::Retries=2 \
             qemu-system-x86 qemu-utils iproute2 dnsmasq-base pppoe ppp python3-pexpect \

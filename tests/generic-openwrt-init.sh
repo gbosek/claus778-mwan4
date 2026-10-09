@@ -128,14 +128,24 @@ IP_CALLS="$TMP/ip-calls.txt"
 ip() {
     printf '%s\n' "$*" >> "$IP_CALLS"
     case "$*" in
-        "-6 route show table main" | \
-        "-4 route show table main default proto 77" | \
-        "-6 route show table main default proto 77") return 0 ;;
+        "-6 route show table main") return 0 ;;
+        "-4 route show table main default proto 77")
+            [ ! -f "$TMP/mwan4-route4-present" ] || cat "$TMP/mwan4-route4-present"
+            return 0 ;;
+        "-6 route show table main default proto 77")
+            [ ! -f "$TMP/mwan4-route6-present" ] || cat "$TMP/mwan4-route6-present"
+            return 0 ;;
         "-4 route save table main default") printf 'ORIGINAL-IPv4'; return 0 ;;
         "-6 route save table main default") printf 'HEAD'; return 0 ;;
-        "-4 route flush table main default proto 77" | \
-        "-6 route flush table main default proto 77" | \
         "-4 route restore") return 0 ;;
+        "-4 route del table main default proto 77")
+            sed '1d' "$TMP/mwan4-route4-present" > "$TMP/mwan4-route4-next"
+            mv "$TMP/mwan4-route4-next" "$TMP/mwan4-route4-present"
+            return 0 ;;
+        "-6 route del table main default proto 77")
+            sed '1d' "$TMP/mwan4-route6-present" > "$TMP/mwan4-route6-next"
+            mv "$TMP/mwan4-route6-next" "$TMP/mwan4-route6-present"
+            return 0 ;;
         "-4 route show table main default" | \
         "-6 route show table main default") return 0 ;;
         *) echo "unexpected route-snapshot ip call: $*" >&2; return 1 ;;
@@ -144,9 +154,11 @@ ip() {
 snapshot_default_routes
 [ -s "$ROUTE_SNAPSHOT_DIR/default4.bin" ]
 [ -s "$ROUTE_SNAPSHOT_DIR/default6.bin" ]
+printf 'default proto 77\ndefault proto 77\n' > "$TMP/mwan4-route4-present"
+printf 'default proto 77\ndefault proto 77\n' > "$TMP/mwan4-route6-present"
 restore_default_routes
-grep -q -- '^-4 route flush table main default proto 77$' "$IP_CALLS"
-grep -q -- '^-6 route flush table main default proto 77$' "$IP_CALLS"
+test "$(grep -c -- '^-4 route del table main default proto 77$' "$IP_CALLS")" -eq 2
+test "$(grep -c -- '^-6 route del table main default proto 77$' "$IP_CALLS")" -eq 2
 grep -q -- '^-4 route restore$' "$IP_CALLS"
 [ ! -e "$ROUTE_SNAPSHOT_DIR/default4.bin" ]
 [ ! -e "$ROUTE_SNAPSHOT_DIR/default6.bin" ]

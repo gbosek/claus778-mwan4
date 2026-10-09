@@ -71,15 +71,37 @@ verify_default_route_metric() {
 # Only touch default routes identified as mwan4 proto-77. Do not flush
 # main-table LAN routes, PBR tables, IP rules, or conntrack on service stop.
 restore_default_routes() {
-	local family snap size
+	local family snap size owned_routes previous_routes cleanup_failed
 	for family in 4 6; do
 		snap="$ROUTE_SNAPSHOT_DIR/default$family.bin"
 		# Even without a saved original default, a user-requested stop
 		# must clean up mwan4-owned routes. Do not touch non-owned routes.
-		if ! ip "-$family" route flush table main default proto 77; then
-			logger -t mwan4 "IPv$family: could not remove owned proto-77 route; leaving snapshot"
-			continue
-		fi
+		cleanup_failed=0
+		while :; do
+			owned_routes="$(ip "-$family" route show table main default proto 77 2>/dev/null)" || {
+				logger -t mwan4 "IPv$family: could not inspect owned proto-77 route; leaving snapshot"
+				cleanup_failed=1
+				break
+			}
+			[ -n "$owned_routes" ] || break
+			previous_routes="$owned_routes"
+			if ! ip "-$family" route del table main default proto 77; then
+				logger -t mwan4 "IPv$family: could not remove owned proto-77 route; leaving snapshot"
+				cleanup_failed=1
+				break
+			fi
+			owned_routes="$(ip "-$family" route show table main default proto 77 2>/dev/null)" || {
+				logger -t mwan4 "IPv$family: could not verify proto-77 route cleanup; leaving snapshot"
+				cleanup_failed=1
+				break
+			}
+			if [ "$owned_routes" = "$previous_routes" ]; then
+				logger -t mwan4 "IPv$family: proto-77 route remained after delete; leaving snapshot"
+				cleanup_failed=1
+				break
+			fi
+		done
+		[ "$cleanup_failed" -eq 0 ] || continue
 		[ -f "$snap" ] || continue
 		size="$(wc -c < "$snap" 2>/dev/null)" || continue
 		if [ "$size" -le 4 ]; then
