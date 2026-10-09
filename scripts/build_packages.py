@@ -53,8 +53,8 @@ LUCI_PKG_NAME = "luci-app-mwan4"
 PKG_VERSION = "1.0.0"
 # 注意：apk 对「同版本替换（1.0.0-r1 -> 1.0.0-r1）」**不会执行 post-install 钩子**，
 # 只有真正的版本升级才会跑（实机验证）。所以只要二进位/脚本有变，就必须递增 release。
-APK_RELEASE = "r13"
-IPK_RELEASE = "13"
+APK_RELEASE = "r14"
+IPK_RELEASE = "14"
 
 # 新生成金钥的位元数 / 可接受的最小位元数
 KEY_SIZE = 2048

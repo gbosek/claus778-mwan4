@@ -63,6 +63,29 @@ OPTIONS:
     );
 }
 
+/// Different MWAN4 member metrics intentionally create primary/backup tiers.
+/// Make that choice visible at startup so a user expecting ECMP does not mistake
+/// a healthy standby WAN for a daemon or link failure.
+fn warn_on_metric_tiers(config: &DaemonConfig) {
+    let mut tiers = std::collections::BTreeMap::<u32, Vec<&str>>::new();
+    for iface in &config.interfaces {
+        tiers.entry(iface.metric).or_default().push(iface.name.as_str());
+    }
+
+    if tiers.len() < 2 {
+        return;
+    }
+
+    let summary = tiers
+        .into_iter()
+        .map(|(metric, names)| format!("{metric} [{}]", names.join(", ")))
+        .collect::<Vec<_>>()
+        .join("; ");
+    warn!(
+        "Configured MWAN4 member metrics form multiple priority tiers ({summary}). Only the lowest metric tier participates in ECMP; higher tiers are primary/backup by design. Set the same MWAN4 member metric on every WAN to load-balance all of them together. This is separate from netifd network.interface metrics."
+    );
+}
+
 /// 行程存活期间一直持有；行程结束由核心自动释放。
 static PID_FILE_LOCK: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
 
@@ -573,7 +596,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(path) = check_config_path {
         match DaemonConfig::load_from_file(&path) {
-            Ok(_) => {
+            Ok(config) => {
+                warn_on_metric_tiers(&config);
                 println!("Configuration OK: {path}");
                 return Ok(());
             }
@@ -609,6 +633,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     };
+
+    warn_on_metric_tiers(&config);
 
     if config.probe_timeout_ms > config.check_interval_ms {
         warn!(

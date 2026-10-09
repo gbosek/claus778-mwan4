@@ -720,6 +720,8 @@ ssh root@192.168.1.1 "mwan4 --check-config /etc/mwan4/mwan4.json"
 > `route_priority` 刻意**不**在 UCI／LuCI 暴露：它必须与 netifd 自己那条 WAN 预设路由
 > 的 metric 一致（通常都是 0），守护进程才能接管预设路由；若设成非 0，netifd 那条
 > metric 较小的路由会永远胜出，故障转移也就不会生效。
+>
+> `interfaces[].metric` 是 **MWAN4 成员 metric**：相同值的成员组成 ECMP；不同值表示主备优先级，只有最低 metric 的在线成员参与 ECMP。daemon 与 `--check-config` 会在存在多个 metric 层级时发出提醒。它与 `/etc/config/network` 中 netifd 的 `network.<wan>.metric` 是两种不同设置。
 
 > 其余选填栏位（未列出者都有预设值）：
 > - `rtt_fail_count`（预设 3）：平滑 RTT 连续超标几次才判 DOWN。
