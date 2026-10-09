@@ -198,4 +198,14 @@ reload_service
     echo "unexpected reload order: $MOCK_ORDER" >&2
     exit 1
 }
-echo "PASS: empty defaults, PPPoE IPv4/IPv6, policy, safe rollback, metric guard and reload"
+# An explicitly disabled service is successful; invalid enabled config is not.
+PROG=/bin/true
+config_load() { :; }
+generate_json_config() { return 1; }
+MOCK_ENABLED=0
+start_service
+MOCK_ENABLED=1
+if start_service; then
+    echo "enabled startup concealed a configuration error" >&2; exit 1
+fi
+echo "PASS: empty defaults, PPPoE IPv4/IPv6, policy, safe rollback, metric guard, reload and startup failure"

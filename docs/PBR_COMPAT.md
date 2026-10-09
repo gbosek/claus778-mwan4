@@ -42,7 +42,7 @@ does not turn a configured standby tier into load balancing.
 Requirements: addon installed, PBR 1.2.3 consumer implementation, fw4 active,
 all configured WANs using `option network`, at most 62 WANs, distinct logical
 names containing letters/digits/underscores. Keep PBR `fw_mask=00ff0000`,
-`uplink_mark=010000` and rule priority in 20000..31000. Widened PBR masks can
+`uplink_mark=00010000` (equivalent leading-zero forms are accepted) and rule priority in 20000..31000. Widened PBR masks can
 expand its cleanup range into other services' rules and are refused here.
 PBR netifd extensions must be removed first; they take precedence over this
 consumer API. Existing distro PBR 1.2.2 does not provide the strategy API.

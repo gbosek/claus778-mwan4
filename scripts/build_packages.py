@@ -50,6 +50,7 @@ PUB_KEY_NAME = "mwan4.rsa.pub"
 
 PKG_NAME = "mwan4"
 LUCI_PKG_NAME = "luci-app-mwan4"
+PBR_COMPAT_PKG_NAME = "mwan4-pbr-compat"
 PKG_VERSION = "1.0.0"
 # 注意：apk 对「同版本替换（1.0.0-r1 -> 1.0.0-r1）」**不会执行 post-install 钩子**，
 # 只有真正的版本升级才会跑（实机验证）。所以只要二进位/脚本有变，就必须递增 release。
@@ -618,6 +619,19 @@ def build_mwan4_data_entries(bin_data: bytes, init_data: bytes, uci_config_data:
     ]
 
 
+def build_pbr_compat_data_entries() -> list[dict]:
+    """Separate opt-in addon; never include it in the base offline bundle."""
+    root = os.path.join(ROOT_DIR, "openwrt", PBR_COMPAT_PKG_NAME, "files")
+    entries = [{"name": path, "is_dir": True}
+               for path in ("lib", "lib/mwan4", "usr", "usr/libexec")]
+    paths = ["usr/libexec/mwan4-pbr-compat", "lib/mwan4/mwan4.uc",
+             "lib/mwan4/pbr_render.uc", "lib/mwan4/pbr-prepare.uc"]
+    for path in paths:
+        entries.append({"name": path, "data": read_file(root, path).replace(b"\r\n", b"\n"),
+                        "mode": 0o755 if path.startswith("usr/libexec/") else 0o644})
+    return entries
+
+
 def _load_po2lmo():
     """载入同目录的 po2lmo.py（不论本脚本如何被启动，都不能依赖 sys.path[0]）。"""
     here = os.path.dirname(os.path.abspath(__file__))
@@ -861,6 +875,23 @@ def main() -> int:
         data_entries=luci_data_entries,
         postinst=LUCI_POST_INSTALL,
         depends=[PKG_NAME, "luci-base"],
+    )
+
+    # Optional PBR adapter packages have no post-install service actions.
+    pbr_entries = build_pbr_compat_data_entries()
+    pbr_deps = [PKG_NAME, "pbr", "ip-full", "nftables-json", "ucode",
+                "ucode-mod-fs", "ucode-mod-uci", "ucode-mod-ubus"]
+    create_exact_apk_package(
+        output_path=os.path.join(PKG_DIR, f"{PBR_COMPAT_PKG_NAME}_0.2.0-r1_noarch.apk"),
+        pkgname=PBR_COMPAT_PKG_NAME, pkgver="0.2.0-r1", arch="noarch",
+        desc="Optional PBR diagnostics and IPv4 strategy adapter for Rust MWAN4",
+        data_entries=pbr_entries, private_key=private_key, depends=pbr_deps,
+    )
+    create_ipk_package(
+        output_path=os.path.join(PKG_DIR, f"{PBR_COMPAT_PKG_NAME}_0.2.0-1_all.ipk"),
+        pkgname=PBR_COMPAT_PKG_NAME, pkgver="0.2.0-1", arch="all",
+        desc="Optional PBR diagnostics and IPv4 strategy adapter for Rust MWAN4",
+        data_entries=pbr_entries, depends=pbr_deps,
     )
 
     # --- 5. 一键安装脚本 ---

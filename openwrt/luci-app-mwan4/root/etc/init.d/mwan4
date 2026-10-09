@@ -691,9 +691,12 @@ start_service() {
 	}
 
 	config_load mwan4
+	local enabled
+	config_get_bool enabled global enabled 0
+	[ "$enabled" -eq 1 ] || return 0
 	generate_json_config || {
-		logger -t mwan4 "mwan4 is disabled or has no WAN interface configured, not starting"
-		return 0
+		logger -t mwan4 "Invalid or unavailable WAN/PBR configuration, not starting"
+		return 1
 	}
 
 	# Validate before taking a route snapshot or starting the daemon.

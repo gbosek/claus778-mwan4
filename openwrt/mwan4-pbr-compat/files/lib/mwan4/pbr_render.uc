@@ -1,5 +1,12 @@
 // MIT. Rust ECMP adapter: PBR matches packets, Rust owns routing and health.
 // Pure renderer shared by the router entry point and host regression tests.
+function validate_pbr_marks(fw_mask, uplink_mark) {
+	// PBR stores hex without 0x; versions use different leading-zero widths.
+	for (let item in [ [fw_mask || '00ff0000', 0xff0000],
+		[uplink_mark || '00010000', 0x10000] ])
+		if (!match(item[0], /^[0-9a-fA-F]{1,8}$/) || hex(item[0]) != item[1])
+			die('Strategy mode requires PBR fw_mask=00ff0000 and uplink_mark=00010000\n');
+}
 function render(config, uplinks) {
 	if (length(uplinks) > 62)
 		die('PBR strategy mode supports at most 62 logical WAN interfaces\n');
@@ -41,4 +48,4 @@ function render(config, uplinks) {
 	return { config: config, manifest: { interfaces: interfaces, strategies: strategies },
 		nft: join('\n', lines) + '\n' };
 }
-return { render: render };
+return { render: render, validate_pbr_marks: validate_pbr_marks };

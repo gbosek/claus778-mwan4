@@ -13,7 +13,7 @@ define Package/mwan4-pbr-compat
   CATEGORY:=Network
   SUBMENU:=Routing and Redirection
   TITLE:=Optional PBR diagnostics and strategy adapter for Rust mwan4 ECMP
-  DEPENDS:=+pbr +ip-full +nftables-json +ucode +ucode-mod-fs +ucode-mod-uci +ucode-mod-ubus
+  DEPENDS:=+mwan4 +pbr +ip-full +nftables-json +ucode +ucode-mod-fs +ucode-mod-uci +ucode-mod-ubus
   PKGARCH:=all
 endef
 

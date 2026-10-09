@@ -11,9 +11,8 @@ if (fs.stat('/usr/share/nftables.d/ruleset-post/20-pbr-netifd.nft'))
 	die('Remove PBR netifd extensions before enabling the MWAN4 strategy adapter\n');
 // PBR sizes its rule cleanup band from fw_mask/uplink_mark. A widened mask
 // can delete other services' rules, even with disjoint mark bits.
-if ((ctx.get('pbr', 'config', 'fw_mask') || '00ff0000') != '00ff0000' ||
-	(ctx.get('pbr', 'config', 'uplink_mark') || '010000') != '010000')
-	die('Strategy mode requires PBR default fw_mask=00ff0000 and uplink_mark=010000\n');
+require('pbr_render').validate_pbr_marks(ctx.get('pbr', 'config', 'fw_mask'),
+	ctx.get('pbr', 'config', 'uplink_mark'));
 let priority = int(ctx.get('pbr', 'config', 'uplink_ip_rules_priority') || '30000');
 if (priority < 20000 || priority > 31000)
 	die('PBR uplink_ip_rules_priority must be within 20000..31000\n');

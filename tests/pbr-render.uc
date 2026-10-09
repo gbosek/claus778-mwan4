@@ -1,5 +1,14 @@
 let render = require('pbr_render').render;
 function check(ok, msg) { if (!ok) die(msg + '\n'); }
+let validate = require('pbr_render').validate_pbr_marks;
+for (let mark in [ null, '010000', '00010000', '10000' ]) validate('00ff0000', mark);
+validate('00FF0000', '00010000');
+for (let marks in [ ['ffff0000', '00010000'], ['00ff0000', '100'],
+	['0x00ff0000', '010000'], ['00ff0000', 'garbage'] ]) {
+	let failed = false;
+	try { validate(marks[0], marks[1]); } catch(e) { failed = true; }
+	check(failed, 'unsafe PBR mark configuration accepted');
+}
 let uplinks = [ { network: 'telecom', device: 'pppoe-wan' },
 	{ network: 'unicom', device: 'eth1' } ];
 let cfg = { interfaces: [ { name: 'pppoe-wan' }, { name: 'eth1' } ],
