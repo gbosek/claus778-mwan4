@@ -1,0 +1,102 @@
+#!/bin/sh
+# Optional PBR compatibility diagnostics for Rust ECMP mwan4.
+# Installing this addon allows mwan4 to skip marked flows in its native policies.
+# This helper itself never modifies routing, firewall or service states.
+set -u
+say() { printf '%s\n' "$*"; }
+warn() { printf 'WARN: %s\n' "$*" >&2; }
+has_service() { [ -x /etc/init.d/pbr ] && [ -f /etc/config/pbr ]; }
+pbr_value() { uci -q get "pbr.config.$1" 2>/dev/null || :; }
+is_enabled() {
+	case "$1" in yes|on|true) return 0 ;; esac
+	[ "$1" -gt 0 ] 2>/dev/null
+}
+check_mark_owner() {
+	# dl12345's nft port and legacy mwan3 own the same 0x3f00 bits.
+	# Installed but stopped mwan3 is allowed; never remove its state here.
+	if nft list table inet mwan3 >/dev/null 2>&1 || {
+		[ -x /etc/init.d/mwan3 ] && /etc/init.d/mwan3 running >/dev/null 2>&1
+	}; then
+		warn "Active mwan3 conflicts with the MWAN4 strategy adapter (mark mask 0x3f00); stop mwan3 before enabling strategy mode"
+		return 1
+	fi
+	return 0
+}
+check() {
+	local failed=0 strict nstrict mode
+	if ! has_service; then
+		say "PBR is not installed; ECMP operates independently."
+		return 0
+	fi
+	mode="$(uci -q get mwan4.global.pbr_mode 2>/dev/null || :)"
+	[ -n "$mode" ] || mode=standalone
+	say "PBR routing mode: $mode"
+	if ! is_enabled "$(pbr_value enabled)"; then
+		say "PBR is disabled. Unmatched traffic uses ECMP."
+		return 0
+	fi
+	if ! command -v nft >/dev/null 2>&1 || ! command -v ip >/dev/null 2>&1; then
+		warn "nft and ip-full are required for PBR route verification"
+		failed=1
+	fi
+	if [ "$mode" != mossdef ] && uci -q show pbr 2>/dev/null | grep -Eq "mwan4_strategy_|mwan4:strategy:"; then
+		warn "Strategy targets require global.pbr_mode=mossdef and PBR 1.2.3"
+		failed=1
+	fi
+	if [ "$mode" = mossdef ]; then
+		check_mark_owner || failed=1
+		if [ ! -f /lib/pbr/platform.uc ] || [ ! -s /var/etc/mwan4-pbr.json ]; then
+			warn "PBR 1.2.3 and an active adapter manifest are required; reload mwan4 first"
+			failed=1
+		fi
+		if is_enabled "$(pbr_value ipv6_enabled)"; then
+			warn "Integrated strategy targets currently support IPv4 only"
+			failed=1
+		fi
+		if is_enabled "$(pbr_value netifd_enabled)"; then
+			warn "Disable PBR netifd_enabled and remove its extensions before using strategy mode"
+			failed=1
+		fi
+		say "Targets: balanced and <logical-WAN>_prefer; failed preferred WANs fall back to ECMP."
+	fi
+	strict="$(pbr_value strict_enforcement)"
+	nstrict="$(pbr_value netifd_strict_enforcement)"
+	if is_enabled "${strict:-1}"; then
+		if [ "$mode" = mossdef ]; then
+			warn "PBR strict_enforcement covers PBR-managed WAN/VPN tables; adapter <WAN>_prefer targets still allow ECMP fallback"
+		else
+			warn "PBR strict enforcement can disable forwarding when its selected interface is down"
+		fi
+	fi
+	if is_enabled "$nstrict"; then
+		warn "PBR netifd strict enforcement can alter default routing; verify it does not override ECMP"
+	fi
+	if [ "$failed" = 0 ]; then
+		say "Configuration check passed; verify live packet routing with status and WAN failure tests."
+	else
+		warn "PBR compatibility check found blocking problems."
+	fi
+	return "$failed"
+}
+status() {
+	check || return 1
+	if has_service; then
+		if /etc/init.d/pbr running >/dev/null 2>&1; then
+			say "PBR service: running"
+		else
+			say "PBR service: not running"
+		fi
+	fi
+	if command -v ip >/dev/null 2>&1; then
+		say "--- IPv4 fwmark rules ---"
+		ip -4 rule show 2>/dev/null | grep 'fwmark' || :
+		say "--- IPv6 fwmark rules ---"
+		ip -6 rule show 2>/dev/null | grep 'fwmark' || :
+	fi
+}
+case "${1:-check}" in
+	check) check ;;
+	status) status ;;
+	check-mark-owner) check_mark_owner ;;
+	*) say "usage: mwan4-pbr-compat [check|status|check-mark-owner]" >&2; exit 2 ;;
+esac

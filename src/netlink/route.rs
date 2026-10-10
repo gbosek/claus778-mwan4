@@ -99,6 +99,7 @@ pub const FRA_PRIORITY: u16 = 6;
 pub const FRA_IIFNAME: u16 = 3;
 pub const FRA_OIFNAME: u16 = 17;
 pub const FRA_TABLE: u16 = 15;
+pub const FRA_SUPPRESS_PREFIXLEN: u16 = 14;
 /// 规则来源标记（u8）：清扫只删带此标记的规则，不动 mwan3/VPN 的规则。
 pub const FRA_PROTOCOL: u16 = 21;
 
@@ -119,11 +120,18 @@ pub const PROBE_SLOT_MAX: u32 = 64;
 
 /// 策略规则的优先序起点（第 i 条用 POLICY_RULE_PRIORITY_BASE + i）
 pub const POLICY_RULE_PRIORITY_BASE: u32 = 9_000;
+/// Optional PBR adapter uses mwan3/mossdef's mark range, separate from PBR's
+/// standalone 0x00ff0000 mask. Two rules per target protect connected routes.
+pub const PBR_MARK_MASK: u32 = 0x3f00;
+pub const PBR_RULE_PRIORITY_BASE: u32 = 8_000;
+pub const PBR_RULE_SLOT_MAX: u32 = 126;
 /// 策略规则数量上限（含来源/目的展开后的总条数）
 pub const POLICY_SLOT_MAX: u32 = 64;
 /// enum fib_rule_attr：来源/目的前缀
 pub const FRA_DST: u16 = 1;
 pub const FRA_SRC: u16 = 2;
+pub const FRA_FWMARK: u16 = 10;
+pub const FRA_FWMASK: u16 = 16;
 /// 探针目标主表 /32 的 metric；与预设路由 priority 分开才能精准辨识删除。
 pub const PROBE_MAIN_ROUTE_METRIC: u32 = 42_760;
 
@@ -378,6 +386,12 @@ pub struct PolicyRule {
     pub source: Option<(Ipv4Addr, u8)>,
     /// 目的前缀（None = 不限制）
     pub destination: Option<(Ipv4Addr, u8)>,
+    /// When set, exclude packets selected by the PBR mark mask.
+    pub skip_mark_mask: Option<u32>,
+    /// Exact masked match for an optional PBR consumer target.
+    pub match_mark: Option<(u32, u32)>,
+    /// Consult main for connected/specific routes before a WAN default.
+    pub suppress_default: bool,
 }
 
 /// 一条 fib_rule 的描述（出向用 oif、入向用 iif）
@@ -1018,6 +1032,16 @@ impl RouteManager {
         if let Some((addr, _)) = rule.destination {
             Self::append_attr(&mut buffer, FRA_DST, &addr.octets());
         }
+        if let Some((mark, mask)) = rule
+            .match_mark
+            .or(rule.skip_mark_mask.map(|mask| (0, mask)))
+        {
+            Self::append_attr(&mut buffer, FRA_FWMARK, &mark.to_ne_bytes());
+            Self::append_attr(&mut buffer, FRA_FWMASK, &mask.to_ne_bytes());
+        }
+        if rule.suppress_default {
+            Self::append_attr(&mut buffer, FRA_SUPPRESS_PREFIXLEN, &0u32.to_ne_bytes());
+        }
         Self::append_attr(&mut buffer, FRA_PROTOCOL, &[PROBE_RULE_PROTOCOL]);
 
         Self::finish_msg(&mut buffer, msg_type, flags, seq);
@@ -1107,13 +1131,23 @@ impl RouteManager {
     pub fn sweep_policy_rules(&mut self) -> io::Result<()> {
         let mut first_err: Option<io::Error> = None;
         let mut removed = 0usize;
-        for slot in 0..POLICY_SLOT_MAX {
-            match self.delete_own_rule_by_priority(POLICY_RULE_PRIORITY_BASE + slot) {
-                Ok(true) => removed += 1,
-                Ok(false) => {}
-                Err(e) => {
-                    if first_err.is_none() {
-                        first_err = Some(e);
+        for priority in (POLICY_RULE_PRIORITY_BASE..POLICY_RULE_PRIORITY_BASE + POLICY_SLOT_MAX)
+            .chain(PBR_RULE_PRIORITY_BASE..PBR_RULE_PRIORITY_BASE + PBR_RULE_SLOT_MAX)
+        {
+            // A single user policy expands into multiple (src,dst) combinations.
+            // Those fib rules intentionally share the same priority. Deleting
+            // once per priority leaves stale rules after an unclean shutdown.
+            // The validator caps expanded rules at POLICY_SLOT_MAX, so each
+            // priority can be drained with a bounded number of netlink calls.
+            for _ in 0..POLICY_SLOT_MAX {
+                match self.delete_own_rule_by_priority(priority) {
+                    Ok(true) => removed += 1,
+                    Ok(false) => break,
+                    Err(e) => {
+                        if first_err.is_none() {
+                            first_err = Some(e);
+                        }
+                        break;
                     }
                 }
             }
@@ -3739,6 +3773,9 @@ mod tests {
             priority: POLICY_RULE_PRIORITY_BASE + 2,
             source: Some(("192.168.3.0".parse().unwrap(), 24)),
             destination: Some(("10.0.0.0".parse().unwrap(), 8)),
+            skip_mark_mask: None,
+            match_mark: None,
+            suppress_default: false,
         };
         let msg = RouteManager::build_policy_rule_msg(
             11,
@@ -3765,6 +3802,45 @@ mod tests {
         assert_eq!(attrs[3].1, vec![10, 0, 0, 0]);
         assert_eq!(attrs[4].1, vec![PROBE_RULE_PROTOCOL]);
 
+        let pbr_rule = PolicyRule {
+            skip_mark_mask: Some(0x00ff0000),
+            ..rule.clone()
+        };
+        let msg = RouteManager::build_policy_rule_msg(
+            20,
+            &pbr_rule,
+            RTM_NEWRULE,
+            NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE,
+        );
+        let (_, masked_attrs) = parse_rule(&msg);
+        assert_eq!(
+            attr_types(&masked_attrs),
+            vec![
+                FRA_TABLE,
+                FRA_PRIORITY,
+                FRA_SRC,
+                FRA_DST,
+                FRA_FWMARK,
+                FRA_FWMASK,
+                FRA_PROTOCOL,
+            ]
+        );
+        assert_eq!(read_u32(&masked_attrs[4].1, 0), Some(0));
+        assert_eq!(read_u32(&masked_attrs[5].1, 0), Some(0x00ff0000));
+
+        let adapter_rule = PolicyRule {
+            match_mark: Some((0x100, PBR_MARK_MASK)),
+            suppress_default: true,
+            ..rule.clone()
+        };
+        let msg =
+            RouteManager::build_policy_rule_msg(21, &adapter_rule, RTM_NEWRULE, NLM_F_REQUEST);
+        let (_, attrs) = parse_rule(&msg);
+        assert_eq!(read_u32(&attrs[4].1, 0), Some(0x100));
+        assert_eq!(read_u32(&attrs[5].1, 0), Some(PBR_MARK_MASK));
+        assert_eq!(attrs[6].0, FRA_SUPPRESS_PREFIXLEN);
+        assert_eq!(read_u32(&attrs[6].1, 0), Some(0));
+
         let any = PolicyRule {
             name: "all".to_string(),
             ifindex: 5,
@@ -3772,6 +3848,9 @@ mod tests {
             priority: POLICY_RULE_PRIORITY_BASE,
             source: None,
             destination: None,
+            skip_mark_mask: None,
+            match_mark: None,
+            suppress_default: false,
         };
         let msg = RouteManager::build_policy_rule_msg(
             12,
@@ -3793,6 +3872,7 @@ mod tests {
         assert!(POLICY_RULE_PRIORITY_BASE + POLICY_SLOT_MAX <= PROBE_RULE_PRIORITY_BASE);
         assert!(POLICY_RULE_PRIORITY_BASE > 0);
         assert!(POLICY_RULE_PRIORITY_BASE + POLICY_SLOT_MAX < PROBE_MAIN_ROUTE_METRIC);
+        assert!(PBR_RULE_PRIORITY_BASE + PBR_RULE_SLOT_MAX <= POLICY_RULE_PRIORITY_BASE);
     }
 
     #[test]
