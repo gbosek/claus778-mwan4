@@ -7,6 +7,17 @@ say() { printf '%s\n' "$*"; }
 warn() { printf 'WARN: %s\n' "$*" >&2; }
 has_service() { [ -x /etc/init.d/pbr ] && [ -f /etc/config/pbr ]; }
 pbr_value() { uci -q get "pbr.config.$1" 2>/dev/null || :; }
+check_mark_owner() {
+	# dl12345's nft port and legacy mwan3 own the same 0x3f00 bits.
+	# Installed but stopped mwan3 is allowed; never remove its state here.
+	if nft list table inet mwan3 >/dev/null 2>&1 || {
+		[ -x /etc/init.d/mwan3 ] && /etc/init.d/mwan3 running >/dev/null 2>&1
+	}; then
+		warn "Active mwan3 conflicts with the MWAN4 strategy adapter (mark mask 0x3f00); stop mwan3 before enabling strategy mode"
+		return 1
+	fi
+	return 0
+}
 check() {
 	local failed=0 strict nstrict mode
 	if ! has_service; then
@@ -29,6 +40,7 @@ check() {
 		failed=1
 	fi
 	if [ "$mode" = mossdef ]; then
+		check_mark_owner || failed=1
 		if [ ! -f /lib/pbr/platform.uc ] || [ ! -s /var/etc/mwan4-pbr.json ]; then
 			warn "PBR 1.2.3 and an active adapter manifest are required; reload mwan4 first"
 			failed=1
@@ -73,5 +85,6 @@ status() {
 case "${1:-check}" in
 	check) check ;;
 	status) status ;;
-	*) say "usage: mwan4-pbr-compat [check|status]" >&2; exit 2 ;;
+	check-mark-owner) check_mark_owner ;;
+	*) say "usage: mwan4-pbr-compat [check|status|check-mark-owner]" >&2; exit 2 ;;
 esac

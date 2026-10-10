@@ -54,8 +54,8 @@ PBR_COMPAT_PKG_NAME = "mwan4-pbr-compat"
 PKG_VERSION = "1.0.0"
 # 注意：apk 对「同版本替换（1.0.0-r1 -> 1.0.0-r1）」**不会执行 post-install 钩子**，
 # 只有真正的版本升级才会跑（实机验证）。所以只要二进位/脚本有变，就必须递增 release。
-APK_RELEASE = "r16"
-IPK_RELEASE = "16"
+APK_RELEASE = "r17"
+IPK_RELEASE = "17"
 
 # 新生成金钥的位元数 / 可接受的最小位元数
 KEY_SIZE = 2048
@@ -882,14 +882,14 @@ def main() -> int:
     pbr_deps = [PKG_NAME, "pbr", "ip-full", "nftables-json", "ucode",
                 "ucode-mod-fs", "ucode-mod-uci", "ucode-mod-ubus"]
     create_exact_apk_package(
-        output_path=os.path.join(PKG_DIR, f"{PBR_COMPAT_PKG_NAME}_0.2.0-r1_noarch.apk"),
-        pkgname=PBR_COMPAT_PKG_NAME, pkgver="0.2.0-r1", arch="noarch",
+        output_path=os.path.join(PKG_DIR, f"{PBR_COMPAT_PKG_NAME}_0.2.1-r1_noarch.apk"),
+        pkgname=PBR_COMPAT_PKG_NAME, pkgver="0.2.1-r1", arch="noarch",
         desc="Optional PBR diagnostics and IPv4 strategy adapter for Rust MWAN4",
         data_entries=pbr_entries, private_key=private_key, depends=pbr_deps,
     )
     create_ipk_package(
-        output_path=os.path.join(PKG_DIR, f"{PBR_COMPAT_PKG_NAME}_0.2.0-1_all.ipk"),
-        pkgname=PBR_COMPAT_PKG_NAME, pkgver="0.2.0-1", arch="all",
+        output_path=os.path.join(PKG_DIR, f"{PBR_COMPAT_PKG_NAME}_0.2.1-1_all.ipk"),
+        pkgname=PBR_COMPAT_PKG_NAME, pkgver="0.2.1-1", arch="all",
         desc="Optional PBR diagnostics and IPv4 strategy adapter for Rust MWAN4",
         data_entries=pbr_entries, depends=pbr_deps,
     )

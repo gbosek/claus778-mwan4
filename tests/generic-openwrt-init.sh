@@ -192,7 +192,7 @@ basescript="/etc/init.d/mwan4"
 MOCK_ORDER=""
 procd_kill() { MOCK_ORDER="$MOCK_ORDER""kill:$1 "; }
 restore_default_routes() { MOCK_ORDER="$MOCK_ORDER""restore "; }
-rc_procd() { MOCK_ORDER="$MOCK_ORDER""start:$1"; }
+rc_procd() { MOCK_ORDER="$MOCK_ORDER""start:$1"; MWAN4_START_RC=0; MWAN4_START_READY=0; }
 reload_service
 [ "$MOCK_ORDER" = "kill:mwan4 restore start:start_service" ] || {
     echo "unexpected reload order: $MOCK_ORDER" >&2
@@ -204,8 +204,17 @@ config_load() { :; }
 generate_json_config() { return 1; }
 MOCK_ENABLED=0
 start_service
+service_started
 MOCK_ENABLED=1
 if start_service; then
     echo "enabled startup concealed a configuration error" >&2; exit 1
+fi
+# Reproduce rc.common's successful close hiding a failed callback.
+rc_procd() { "$@" || :; return 0; }
+if reload_service; then
+    echo "reload concealed a failed start callback" >&2; exit 1
+fi
+if service_started; then
+    echo "post-start callback concealed startup failure" >&2; exit 1
 fi
 echo "PASS: empty defaults, PPPoE IPv4/IPv6, policy, safe rollback, metric guard, reload and startup failure"

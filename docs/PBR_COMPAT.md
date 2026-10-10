@@ -20,7 +20,7 @@ own failure semantics; MWAN4 does not synchronize those external tables.
 
 ## mossdef consumer mode (experimental, IPv4)
 
-The optional `mwan4-pbr-compat` 0.2.0 package now supplies the consumer API
+The optional `mwan4-pbr-compat` 0.2.1 package now supplies the consumer API
 used by [mossdef PBR 1.2.3](https://github.com/mossdef-org/pbr/tree/1.2.3):
 `require('mwan4')`, interface marks and `mwan4_strategy_*` nft chain prefixes.
 PBR owns packet matching; Rust owns the marked routes and health decisions.
@@ -46,6 +46,10 @@ names containing letters/digits/underscores. Keep PBR `fw_mask=00ff0000`,
 expand its cleanup range into other services' rules and are refused here.
 PBR netifd extensions must be removed first; they take precedence over this
 consumer API. Existing distro PBR 1.2.2 does not provide the strategy API.
+The 0.2.1 adapter refuses an active `inet mwan3` table or running mwan3
+service: both own `0x3f00`. An installed, stopped mwan3 package is allowed.
+Stop it before enabling strategy mode; the guard never removes its table,
+rules or configuration. This check is not a general audit of all mark users.
 
 After configuring and enabling PBR, opt in using LuCI's advanced **PBR
 Integration** setting or:

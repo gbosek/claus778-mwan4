@@ -1,6 +1,6 @@
 # XG2010G 下一轮实机测试
 
-适用于本仓库 r16 和 `mwan4-pbr-compat` 0.2.0，配套 mossdef PBR 1.2.3。
+适用于本仓库 r17 和 `mwan4-pbr-compat` 0.2.1，配套 mossdef PBR 1.2.3。
 先确认对应提交的 QEMU 集成通过，再重新编译/安装固件；旧固件不能验证新适配器。
 配置步骤见 [PBR_COMPAT.md](PBR_COMPAT.md)。测试优先规则使用实际逻辑 WAN
 名字，例如 `mwan4_strategy_unicom_prefer`，不是设备名 `lan3`。
