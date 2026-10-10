@@ -398,6 +398,12 @@ class Lab:
             ("mwan4_ci.name", "CI_DHCP_WAN"),
             ("mwan4_ci.src_addr", "192.0.2.0/24"),
             ("mwan4_ci.interface", "dhcpwan"),
+            # Destination-prefix routing is the carrier-affinity use case:
+            # PBR matches the prefix and mwan4 supplies the WAN strategy.
+            ("mwan4_dest_ci", "policy"),
+            ("mwan4_dest_ci.name", "CI_DHCP_DEST_WAN"),
+            ("mwan4_dest_ci.dest_addr", "198.18.0.0/15"),
+            ("mwan4_dest_ci.interface", "dhcpwan"),
         ):
             self.cmd(f"uci set pbr.{key}={value}")
         # dhcpwan does not match PBR's built-in 'wan*' naming heuristic.
@@ -418,6 +424,7 @@ class Lab:
             raise
         self.cmd("fw4 print >/tmp/mwan4-fw4.nft; test -s /tmp/mwan4-fw4.nft")
         self.cmd("nft list ruleset | grep -q pbr")
+        self.cmd("nft list ruleset | grep -q '198.18.0.0/15'")
         self.cmd("/etc/init.d/mwan4 reload")
         self.cmd("grep -E 'policy_skip_mark_mask.*[1-9][0-9]*' /var/etc/mwan4.json")
         self.wait("pidof mwan4 >/dev/null", 45)
@@ -480,7 +487,8 @@ class Lab:
         self.cmd("tar -xf /tmp/pbr-1.2.3.tar -C /; chmod 755 /etc/init.d/pbr")
         for key, value in (("mwan4.global.pbr_mode", "mossdef"),
                            ("pbr.config.ipv6_enabled", "0"),
-                           ("pbr.mwan4_ci.interface", "mwan4_strategy_dhcpwan_prefer")):
+                           ("pbr.mwan4_ci.interface", "mwan4_strategy_dhcpwan_prefer"),
+                           ("pbr.mwan4_dest_ci.interface", "mwan4_strategy_dhcpwan_prefer")):
             self.cmd(f"uci set {key}={value}")
         self.cmd("uci commit mwan4; uci commit pbr; /etc/init.d/mwan4 reload", 95)
         self.wait("ip -4 rule show | grep -q 'fwmark 0x200/0x3f00 lookup 10001'", 60)
@@ -506,6 +514,7 @@ class Lab:
         self.cmd("ip -4 rule show | grep -Eq 'fwmark (0x)?0/0xff3f00'")
         self.cmd("/etc/init.d/pbr restart", 95)
         self.cmd("/usr/libexec/mwan4-pbr-compat check")
+        self.cmd("nft list ruleset | grep -q '198.18.0.0/15'")
         self.cmd("nft list ruleset | grep -q 'goto mwan4_strategy_dhcpwan_prefer_ipv4'")
         self.cmd("ip -4 route get 198.18.0.1 from 192.0.2.10 mark 0x200 | grep -q 'table 10001'")
         self.cmd("/etc/init.d/firewall reload", 40)

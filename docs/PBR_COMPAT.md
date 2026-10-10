@@ -76,6 +76,40 @@ config policy 'downloads'
     option interface 'mwan4_strategy_unicom_prefer'
 ```
 
+### Carrier destination prefixes with weighted ECMP for everything else
+
+For carrier-affinity routing, add PBR policies for the current IPv4 prefixes
+you want to send through each provider. The following addresses are reserved
+documentation examples only; replace them with verified Telecom and Unicom
+prefixes before applying the configuration. `wan` and `wanb` are example
+logical WAN names and must match the `network` names configured in MWAN4.
+
+```uci
+config policy 'telecom_prefixes'
+    option name 'Telecom destinations via Telecom'
+    option dest_addr '203.0.113.0/24'
+    option interface 'mwan4_strategy_wan_prefer'
+
+config policy 'unicom_prefixes'
+    option name 'Unicom destinations via Unicom'
+    option dest_addr '198.51.100.0/24'
+    option interface 'mwan4_strategy_wanb_prefer'
+```
+
+PBR accepts multiple destination CIDRs in `dest_addr`. Keep these provider
+prefixes current from a trusted route source. Do not add a catch-all policy:
+unmatched IPv4 traffic follows MWAN4's main-table ECMP automatically. Set
+`max_mbps` on every MWAN4 WAN to its measured end-to-end download capacity;
+the base ECMP ratio is `weight × max_mbps`, so unmatched flows follow the
+configured line-capacity ratio. A `<WAN>_prefer` target falls back to global
+ECMP if its preferred WAN is down. Strict WAN-only behavior is not currently
+provided by the adapter.
+
+Verify each provider policy with new IPv4 connections, PBR nft counters, the
+selected WAN's byte counters, and a WAN-down/recovery test. Check the client
+uses the router's resolver for domain policies. Do not infer carrier routing
+from the presence of an `ip rule` alone.
+
 Use PBR's resolver integration (e.g. dnsmasq nft sets) for domain matching;
 MWAN4 does not perform DNS classification. Configure VPN targets in PBR
 normally; interfaces outside MWAN4 continue to use PBR's standalone tables.
