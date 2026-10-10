@@ -494,6 +494,16 @@ class Lab:
         self.cmd("/etc/init.d/mwan4 reload", 95)
         self.wait("ip -4 rule show | grep -q 'fwmark 0x200/0x3f00 lookup 10001'", 60)
         self.checkpoint("PASS: competing mwan3 mark owner refused without deleting its table")
+        # Match upstream PBR's boolean spellings, including non-numeric true.
+        for field in ("ipv6_enabled", "netifd_enabled"):
+            self.cmd(f"uci set pbr.config.{field}=true; uci commit pbr")
+            self.cmd("! /etc/init.d/mwan4 reload", 95)
+            self.cmd(f"uci set pbr.config.{field}=0; uci commit pbr")
+        self.cmd("uci set pbr.config.enabled=true; uci commit pbr")
+        self.cmd("/etc/init.d/mwan4 reload", 95)
+        self.wait("ip -4 rule show | grep -q 'fwmark 0x200/0x3f00 lookup 10001'", 60)
+        self.checkpoint("PASS: PBR boolean formats and IPv6/netifd exclusion")
+        self.cmd("ip -4 rule show | grep -Eq 'fwmark (0x)?0/0xff3f00'")
         self.cmd("/etc/init.d/pbr restart", 95)
         self.cmd("/usr/libexec/mwan4-pbr-compat check")
         self.cmd("nft list ruleset | grep -q 'goto mwan4_strategy_dhcpwan_prefer_ipv4'")

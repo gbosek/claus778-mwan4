@@ -18,4 +18,12 @@ fi
 # No competing table or running service on the isolated CI test host.
 MOCK_NFT_RC=1
 sh "$tmp/helper" check-mark-owner
+set -- check-mark-owner
+. "$tmp/helper"
+for value in 1 2 yes on true; do is_enabled "$value"; done
+for value in 0 no off false ''; do
+    if is_enabled "$value"; then
+        echo "accepted disabled flag: $value" >&2; exit 1
+    fi
+done
 echo 'PASS: competing mwan3 table refused, only read-only nft lookup used'

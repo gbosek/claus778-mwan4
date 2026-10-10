@@ -1,5 +1,22 @@
 let render = require('pbr_render').render;
 function check(ok, msg) { if (!ok) die(msg + '\n'); }
+let renderer = require('pbr_render');
+for (let value in [ '1', 'yes', 'on', 'true', '2' ]) {
+	check(renderer.is_enabled(value), 'PBR boolean format rejected');
+	renderer.validate_pbr_flags({ enabled: value, ipv6_enabled: 'off' });
+	for (let field in ['ipv6_enabled', 'netifd_enabled']) {
+		let flags = { enabled: '1' }, failed = false;
+		flags[field] = value;
+		try { renderer.validate_pbr_flags(flags); } catch(e) { failed = true; }
+		check(failed, 'enabled conflicting flag accepted');
+	}
+}
+for (let value in [ null, '0', 'no', 'off', 'false', '' ]) {
+	check(!renderer.is_enabled(value), 'disabled PBR boolean accepted');
+	let failed = false;
+	try { renderer.validate_pbr_flags({ enabled: value }); } catch(e) { failed = true; }
+	check(failed, 'disabled PBR accepted for integration');
+}
 let validate = require('pbr_render').validate_pbr_marks;
 for (let mark in [ null, '010000', '00010000', '10000' ]) validate('00ff0000', mark);
 validate('00FF0000', '00010000');

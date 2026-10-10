@@ -2,10 +2,11 @@
 let fs = require('fs');
 let ctx = require('uci').cursor();
 let bus = require('ubus').connect();
-let render = require('pbr_render').render;
-if (ctx.get('pbr', 'config', 'enabled') != '1') die('Enable PBR before selecting mossdef mode\n');
-if (ctx.get('pbr', 'config', 'ipv6_enabled') == '1')
-	die('PBR strategy adapter currently supports IPv4 only; set pbr.config.ipv6_enabled=0\n');
+let renderer = require('pbr_render');
+let render = renderer.render;
+renderer.validate_pbr_flags({ enabled: ctx.get('pbr', 'config', 'enabled'),
+	ipv6_enabled: ctx.get('pbr', 'config', 'ipv6_enabled'),
+	netifd_enabled: ctx.get('pbr', 'config', 'netifd_enabled') });
 if (!fs.stat('/lib/pbr/platform.uc')) die('PBR 1.2.3 consumer API is required for mossdef mode\n');
 if (fs.stat('/usr/share/nftables.d/ruleset-post/20-pbr-netifd.nft'))
 	die('Remove PBR netifd extensions before enabling the MWAN4 strategy adapter\n');
@@ -21,7 +22,7 @@ if ((config.policy_skip_mark_mask || 0) & 0x3f00)
 	die('PBR fw_mask overlaps the adapter mask 0x3f00\n');
 let uplinks = [];
 ctx.foreach('mwan4', 'interface', function(section) {
-	if (section.enabled == '0') return;
+	if (!renderer.is_enabled(section.enabled ?? '1')) return;
 	if (!section.network) die('PBR strategy mode requires option network for each WAN\n');
 	let status = bus.call('network.interface.' + section.network, 'status', {}) || {};
 	push(uplinks, { network: section.network, device: status.l3_device || '' });

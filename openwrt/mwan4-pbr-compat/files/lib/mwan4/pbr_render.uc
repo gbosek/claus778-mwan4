@@ -1,5 +1,15 @@
 // MIT. Rust ECMP adapter: PBR matches packets, Rust owns routing and health.
 // Pure renderer shared by the router entry point and host regression tests.
+function is_enabled(value) {
+	return +value > 0 || value == 'yes' || value == 'on' || value == 'true';
+}
+function validate_pbr_flags(config) {
+	if (!is_enabled(config.enabled)) die('Enable PBR before selecting mossdef mode\n');
+	if (is_enabled(config.ipv6_enabled))
+		die('PBR strategy adapter currently supports IPv4 only; set pbr.config.ipv6_enabled=0\n');
+	if (is_enabled(config.netifd_enabled))
+		die('Disable PBR netifd_enabled before enabling the MWAN4 strategy adapter\n');
+}
 function validate_pbr_marks(fw_mask, uplink_mark) {
 	// PBR stores hex without 0x; versions use different leading-zero widths.
 	for (let item in [ [fw_mask || '00ff0000', 0xff0000],
@@ -48,4 +58,5 @@ function render(config, uplinks) {
 	return { config: config, manifest: { interfaces: interfaces, strategies: strategies },
 		nft: join('\n', lines) + '\n' };
 }
-return { render: render, validate_pbr_marks: validate_pbr_marks };
+return { render: render, validate_pbr_marks: validate_pbr_marks,
+	is_enabled: is_enabled, validate_pbr_flags: validate_pbr_flags };

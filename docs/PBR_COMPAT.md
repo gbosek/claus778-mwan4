@@ -20,7 +20,7 @@ own failure semantics; MWAN4 does not synchronize those external tables.
 
 ## mossdef consumer mode (experimental, IPv4)
 
-The optional `mwan4-pbr-compat` 0.2.1 package now supplies the consumer API
+The optional `mwan4-pbr-compat` 0.2.2 package now supplies the consumer API
 used by [mossdef PBR 1.2.3](https://github.com/mossdef-org/pbr/tree/1.2.3):
 `require('mwan4')`, interface marks and `mwan4_strategy_*` nft chain prefixes.
 PBR owns packet matching; Rust owns the marked routes and health decisions.
@@ -44,9 +44,9 @@ all configured WANs using `option network`, at most 62 WANs, distinct logical
 names containing letters/digits/underscores. Keep PBR `fw_mask=00ff0000`,
 `uplink_mark=00010000` (equivalent leading-zero forms are accepted) and rule priority in 20000..31000. Widened PBR masks can
 expand its cleanup range into other services' rules and are refused here.
-PBR netifd extensions must be removed first; they take precedence over this
+PBR `netifd_enabled` must be disabled and its extensions removed first; they take precedence over this
 consumer API. Existing distro PBR 1.2.2 does not provide the strategy API.
-The 0.2.1 adapter refuses an active `inet mwan3` table or running mwan3
+The 0.2.2 adapter refuses an active `inet mwan3` table or running mwan3
 service: both own `0x3f00`. An installed, stopped mwan3 package is allowed.
 Stop it before enabling strategy mode; the guard never removes its table,
 rules or configuration. This check is not a general audit of all mark users.
@@ -56,6 +56,7 @@ Integration** setting or:
 
 ```sh
 uci set pbr.config.ipv6_enabled='0'
+uci set pbr.config.netifd_enabled='0'
 uci commit pbr
 uci set mwan4.global.pbr_mode='mossdef'
 uci commit mwan4
@@ -71,13 +72,53 @@ config policy 'downloads'
     option name 'Downloads prefer Unicom'
     option src_addr '192.168.1.100'
     option dest_port '80 443'
-    option proto 'tcp'
+    option proto 'tcp udp'
     option interface 'mwan4_strategy_unicom_prefer'
 ```
 
 Use PBR's resolver integration (e.g. dnsmasq nft sets) for domain matching;
 MWAN4 does not perform DNS classification. Configure VPN targets in PBR
 normally; interfaces outside MWAN4 continue to use PBR's standalone tables.
+
+### DNS and rule matching
+
+PBR 1.2.3 is an upstream development branch; pin a reviewed commit and use
+a matching LuCI/RPC package when configuring it through the web interface.
+Its brief README still says shell-based, but the reviewed implementation
+uses `/lib/pbr/*.uc`. Documentation linked from it identifies itself as
+1.2.2, so consumer behavior must be checked against the 1.2.3 source.
+
+For domain policies, set `resolver_set=dnsmasq.nftset` and verify the actual
+dnsmasq build advertises `nftset` (not `no-nftset`). A compatible dnsmasq-full
+build is typically required. Clients must use the resolver that populates
+PBR's sets. PBR matches resolved IP addresses, not HTTPS URLs; shared CDN
+addresses can affect other domains, and browser DoH may bypass this path.
+
+```sh
+dnsmasq --version | grep -E '(^|[[:space:]])nftset([[:space:]]|$)'
+uci set pbr.config.resolver_set='dnsmasq.nftset'
+uci commit pbr
+```
+
+Example domain rule (replace `example.com` with your test domain):
+
+```uci
+config policy 'domain_unicom'
+    option name 'Test domain prefer Unicom'
+    option dest_addr 'example.com'
+    option interface 'mwan4_strategy_unicom_prefer'
+```
+
+Place specific policies before a broader matching policy. Port 443 can use
+both TCP (HTTPS) and UDP (HTTP/3/QUIC), so the port example includes both.
+LAN-forwarded traffic uses `prerouting`; router-originated requests need an
+`output` policy. A successful service start proves neither DNS population
+nor actual packet matching: check nft sets/counters and the real WAN exit.
+
+`strict_enforcement` applies to PBR-managed interface tables; it does not
+change external adapter `<WAN>_prefer` targets into strict targets. They
+continue to permit ECMP fallback. Keep VPN leak-prevention policies on an
+appropriate strict VPN target, with separate failure validation.
 
 ### Routing and lifecycle
 

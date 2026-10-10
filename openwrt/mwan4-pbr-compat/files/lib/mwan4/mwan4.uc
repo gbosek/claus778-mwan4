@@ -4,7 +4,7 @@ let data = { interfaces: {}, strategies: {} };
 function load() {
 	data = { interfaces: {}, strategies: {} };
 	let ctx = require('uci').cursor();
-	if (ctx.get('mwan4', 'global', 'enabled') != '1' ||
+	if (!require('pbr_render').is_enabled(ctx.get('mwan4', 'global', 'enabled')) ||
 		ctx.get('mwan4', 'global', 'pbr_mode') != 'mossdef') return;
 	let raw = require('fs').readfile('/var/etc/mwan4-pbr.json');
 	if (raw) data = json(raw);

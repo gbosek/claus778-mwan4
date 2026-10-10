@@ -330,7 +330,8 @@ generate_json_config() {
 	local pbr_skip_mask_json="null" pbr_mask pbr_enabled
 	if [ -x /usr/libexec/mwan4-pbr-compat ] && [ -f /etc/config/pbr ] && command -v uci >/dev/null 2>&1; then
 		pbr_enabled="$(uci -q get pbr.config.enabled 2>/dev/null || :)"
-		if [ "$pbr_enabled" = "1" ]; then
+		case "$pbr_enabled" in yes|on|true) pbr_enabled=1 ;; esac
+		if [ "$pbr_enabled" -gt 0 ] 2>/dev/null; then
 			pbr_mask="$(uci -q get pbr.config.fw_mask 2>/dev/null || :)"
 			[ -n "$pbr_mask" ] || pbr_mask="00ff0000"
 			if ! printf '%s' "$pbr_mask" | grep -Eq '^[[:xdigit:]]{8}$'; then

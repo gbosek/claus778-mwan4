@@ -7,6 +7,10 @@ say() { printf '%s\n' "$*"; }
 warn() { printf 'WARN: %s\n' "$*" >&2; }
 has_service() { [ -x /etc/init.d/pbr ] && [ -f /etc/config/pbr ]; }
 pbr_value() { uci -q get "pbr.config.$1" 2>/dev/null || :; }
+is_enabled() {
+	case "$1" in yes|on|true) return 0 ;; esac
+	[ "$1" -gt 0 ] 2>/dev/null
+}
 check_mark_owner() {
 	# dl12345's nft port and legacy mwan3 own the same 0x3f00 bits.
 	# Installed but stopped mwan3 is allowed; never remove its state here.
@@ -27,7 +31,7 @@ check() {
 	mode="$(uci -q get mwan4.global.pbr_mode 2>/dev/null || :)"
 	[ -n "$mode" ] || mode=standalone
 	say "PBR routing mode: $mode"
-	if [ "$(pbr_value enabled)" != "1" ]; then
+	if ! is_enabled "$(pbr_value enabled)"; then
 		say "PBR is disabled. Unmatched traffic uses ECMP."
 		return 0
 	fi
@@ -45,18 +49,26 @@ check() {
 			warn "PBR 1.2.3 and an active adapter manifest are required; reload mwan4 first"
 			failed=1
 		fi
-		if [ "$(pbr_value ipv6_enabled)" = 1 ]; then
+		if is_enabled "$(pbr_value ipv6_enabled)"; then
 			warn "Integrated strategy targets currently support IPv4 only"
+			failed=1
+		fi
+		if is_enabled "$(pbr_value netifd_enabled)"; then
+			warn "Disable PBR netifd_enabled and remove its extensions before using strategy mode"
 			failed=1
 		fi
 		say "Targets: balanced and <logical-WAN>_prefer; failed preferred WANs fall back to ECMP."
 	fi
 	strict="$(pbr_value strict_enforcement)"
 	nstrict="$(pbr_value netifd_strict_enforcement)"
-	if [ "$strict" = "1" ]; then
-		warn "PBR strict enforcement can disable forwarding when its policies fail; review before production use"
+	if is_enabled "${strict:-1}"; then
+		if [ "$mode" = mossdef ]; then
+			warn "PBR strict_enforcement covers PBR-managed WAN/VPN tables; adapter <WAN>_prefer targets still allow ECMP fallback"
+		else
+			warn "PBR strict enforcement can disable forwarding when its selected interface is down"
+		fi
 	fi
-	if [ "$nstrict" = "1" ]; then
+	if is_enabled "$nstrict"; then
 		warn "PBR netifd strict enforcement can alter default routing; verify it does not override ECMP"
 	fi
 	if [ "$failed" = 0 ]; then

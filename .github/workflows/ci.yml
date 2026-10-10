@@ -170,8 +170,8 @@ jobs:
           python scripts/build_packages.py --arch x86_64
           test -f dist/SHA256SUMS
           test -f dist/mwan4-x86_64-bundle.tar.gz
-          test -f dist/packages/mwan4-pbr-compat_0.2.1-r1_noarch.apk
-          test -f dist/packages/mwan4-pbr-compat_0.2.1-1_all.ipk
+          test -f dist/packages/mwan4-pbr-compat_0.2.2-r1_noarch.apk
+          test -f dist/packages/mwan4-pbr-compat_0.2.2-1_all.ipk
           ls -l dist/packages dist/SHA256SUMS
       - name: IPK control still validates (python)
         run: |
@@ -183,7 +183,7 @@ jobs:
               ctrl = tarfile.open(fileobj=io.BytesIO(t.extractfile(name).read()), mode="r:gz")
               assert "conffiles" in ctrl.getnames(), "IPK must declare conffiles"
           print("OK", ipk)
-          addon = "dist/packages/mwan4-pbr-compat_0.2.1-1_all.ipk"
+          addon = "dist/packages/mwan4-pbr-compat_0.2.2-1_all.ipk"
           with tarfile.open(addon, "r:gz") as t:
               ctrl = tarfile.open(fileobj=io.BytesIO(t.extractfile("control.tar.gz").read()), mode="r:gz")
               assert "postinst" not in ctrl.getnames(), "addon must not auto-start services"
