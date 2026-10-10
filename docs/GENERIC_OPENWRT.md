@@ -97,7 +97,11 @@ DHCP/PPPoE gateways change; kernel namespace and router tests remain
 required for complete recovery assurance.
 
 Package installation must never enable mwan4 automatically. Preserve
-local UCI config on upgrades. Only enable after reviewing chosen WANs.
+local UCI config on upgrades. The package installs
+`/lib/upgrade/keep.d/mwan4`, which adds `/etc/config/mwan4` to the backup list
+for subsequent `sysupgrade` runs. Install this release before the next
+firmware upgrade; an explicit `sysupgrade -n` still discards configuration.
+Only enable after reviewing chosen WANs.
 
 ## Source audit follow-up
 

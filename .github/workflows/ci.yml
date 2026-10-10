@@ -44,6 +44,7 @@ jobs:
         run: |
           grep -q "^\s*option enabled '0'$" openwrt/luci-app-mwan4/root/etc/config/mwan4
           ! grep -q "^config interface" openwrt/luci-app-mwan4/root/etc/config/mwan4
+          test "$(cat openwrt/luci-app-mwan4/root/lib/upgrade/keep.d/mwan4)" = "/etc/config/mwan4"
 
   # ── 品质关卡：格式、静态检查、单元测试 ────────────────────────────────
   quality:
@@ -182,6 +183,10 @@ jobs:
               name = [n for n in t.getnames() if n.startswith("control.tar")][0]
               ctrl = tarfile.open(fileobj=io.BytesIO(t.extractfile(name).read()), mode="r:gz")
               assert "conffiles" in ctrl.getnames(), "IPK must declare conffiles"
+              data_name = [n for n in t.getnames() if n.startswith("data.tar")][0]
+              data = tarfile.open(fileobj=io.BytesIO(t.extractfile(data_name).read()), mode="r:gz")
+              keep = data.extractfile("lib/upgrade/keep.d/mwan4")
+              assert keep and keep.read() == b"/etc/config/mwan4\n", "IPK must preserve UCI config across sysupgrade"
           print("OK", ipk)
           addon = "dist/packages/mwan4-pbr-compat_0.2.2-1_all.ipk"
           with tarfile.open(addon, "r:gz") as t:
@@ -192,6 +197,8 @@ jobs:
               assert "lib/mwan4/pbr_render.uc" in data.getnames()
           with tarfile.open("dist/mwan4-x86_64-bundle.tar.gz", "r:gz") as t:
               assert not any("pbr" in name for name in t.getnames()), "base bundle must keep PBR opt-in"
+              keep = t.extractfile("lib/upgrade/keep.d/mwan4")
+              assert keep and keep.read() == b"/etc/config/mwan4\n", "bundle must preserve UCI config across sysupgrade"
           PY
 
   kernel-netns:

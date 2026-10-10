@@ -54,8 +54,8 @@ PBR_COMPAT_PKG_NAME = "mwan4-pbr-compat"
 PKG_VERSION = "1.0.0"
 # 注意：apk 对「同版本替换（1.0.0-r1 -> 1.0.0-r1）」**不会执行 post-install 钩子**，
 # 只有真正的版本升级才会跑（实机验证）。所以只要二进位/脚本有变，就必须递增 release。
-APK_RELEASE = "r18"
-IPK_RELEASE = "18"
+APK_RELEASE = "r19"
+IPK_RELEASE = "19"
 
 # 新生成金钥的位元数 / 可接受的最小位元数
 KEY_SIZE = 2048
@@ -606,7 +606,12 @@ def read_file(*parts: str) -> bytes:
         return f.read()
 
 
-def build_mwan4_data_entries(bin_data: bytes, init_data: bytes, uci_config_data: bytes) -> list[dict]:
+def build_mwan4_data_entries(
+    bin_data: bytes,
+    init_data: bytes,
+    uci_config_data: bytes,
+    sysupgrade_keep_data: bytes,
+) -> list[dict]:
     return [
         {"name": "usr", "is_dir": True},
         {"name": "usr/bin", "is_dir": True},
@@ -616,6 +621,10 @@ def build_mwan4_data_entries(bin_data: bytes, init_data: bytes, uci_config_data:
         {"name": "etc/config/mwan4", "data": uci_config_data, "mode": 0o644},
         {"name": "etc/init.d", "is_dir": True},
         {"name": "etc/init.d/mwan4", "data": init_data, "mode": 0o755},
+        {"name": "lib", "is_dir": True},
+        {"name": "lib/upgrade", "is_dir": True},
+        {"name": "lib/upgrade/keep.d", "is_dir": True},
+        {"name": "lib/upgrade/keep.d/mwan4", "data": sysupgrade_keep_data, "mode": 0o644},
     ]
 
 
@@ -791,6 +800,9 @@ def main() -> int:
     # --- 2. 来源档案 ---
     init_data = read_file(ROOT_DIR, "openwrt", "luci-app-mwan4", "root", "etc", "init.d", "mwan4")
     uci_config_data = read_file(ROOT_DIR, "openwrt", "luci-app-mwan4", "root", "etc", "config", "mwan4")
+    sysupgrade_keep_data = read_file(
+        ROOT_DIR, "openwrt", "luci-app-mwan4", "root", "lib", "upgrade", "keep.d", "mwan4"
+    )
     menu_data = read_file(ROOT_DIR, "openwrt", "luci-app-mwan4", "root", "usr", "share", "luci", "menu.d", "luci-app-mwan4.json")
     acl_data = read_file(ROOT_DIR, "openwrt", "luci-app-mwan4", "root", "usr", "share", "rpcd", "acl.d", "luci-app-mwan4.json")
     view_data = read_file(ROOT_DIR, "openwrt", "luci-app-mwan4", "htdocs", "luci-static", "resources", "view", "mwan4", "overview.js")
@@ -817,7 +829,9 @@ def main() -> int:
         shutil.copy2(bin_src, standalone_bin)
         log(f"[+] Standalone binary: {standalone_bin} ({os.path.getsize(standalone_bin)} bytes)")
 
-        data_entries = build_mwan4_data_entries(bin_data, init_data, uci_config_data)
+        data_entries = build_mwan4_data_entries(
+            bin_data, init_data, uci_config_data, sysupgrade_keep_data
+        )
         apk_ver = f"{PKG_VERSION}-{APK_RELEASE}"
         ipk_ver = f"{PKG_VERSION}-{IPK_RELEASE}"
 
