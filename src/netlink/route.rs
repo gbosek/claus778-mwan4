@@ -4051,7 +4051,7 @@ mod tests {
         {
             RouteManager::append_attr(&mut mask_only_dump, *attr_type, data);
         }
-        RouteManager::finish_msg(&mut mask_only_dump, RTM_NEWRULE, NLM_F_MULTI, 22);
+        RouteManager::finish_msg(&mut mask_only_dump, RTM_NEWRULE, 0, 22);
         let parsed = RouteManager::parse_owned_policy_rule(&mask_only_dump).unwrap();
         assert_eq!(parsed.skip_mark_mask, Some(0x00ff0000));
         assert_eq!(parsed.match_mark, None);
