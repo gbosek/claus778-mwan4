@@ -850,6 +850,12 @@ fn netns_policy_routing() {
         !rules.contains("192.168.9.0/24"),
         "策略规则未被移除:\n{rules}"
     );
+    assert!(
+        rm.dump_owned_policy_rules()
+            .expect("dump policy rules after removal")
+            .is_empty(),
+        "owned policy rules remained after clearing:\n{rules}"
+    );
 
     // One policy can expand into several rules with the SAME priority.
     // A crash/restart must drain every matching rule, not merely the first.

@@ -1295,6 +1295,10 @@ impl RouteManager {
         }
         let (skip_mark_mask, match_mark) = match (mark, mask) {
             (Some(0), Some(mask)) => (Some(mask), None),
+            // Linux may omit FRA_FWMARK when its value is zero while still
+            // returning the non-zero FRA_FWMASK. The kernel's implicit mark
+            // value is zero, so preserve this as our zero-mark exemption rule.
+            (None, Some(mask)) => (Some(mask), None),
             (Some(value), Some(mask)) => (None, Some((value, mask))),
             (None, None) => (None, None),
             _ => return None,
@@ -4035,6 +4039,22 @@ mod tests {
         );
         assert_eq!(read_u32(&masked_attrs[4].1, 0), Some(0));
         assert_eq!(read_u32(&masked_attrs[5].1, 0), Some(0x00ff0000));
+
+        // Kernel rule dumps may omit FRA_FWMARK for zero and return only the
+        // mask. Parsing must still recognize the rule as one of ours so stale
+        // rules can be reconciled and removed.
+        let mut mask_only_dump = vec![0u8; NlMsgHdr::LEN];
+        mask_only_dump.extend_from_slice(&parse_rule(&msg).0.to_bytes());
+        for (attr_type, data) in masked_attrs
+            .iter()
+            .filter(|(attr_type, _)| *attr_type != FRA_FWMARK)
+        {
+            RouteManager::append_attr(&mut mask_only_dump, *attr_type, data);
+        }
+        RouteManager::finish_msg(&mut mask_only_dump, RTM_NEWRULE, NLM_F_MULTI, 22);
+        let parsed = RouteManager::parse_owned_policy_rule(&mask_only_dump).unwrap();
+        assert_eq!(parsed.skip_mark_mask, Some(0x00ff0000));
+        assert_eq!(parsed.match_mark, None);
 
         let adapter_rule = PolicyRule {
             match_mark: Some((0x100, PBR_MARK_MASK)),
