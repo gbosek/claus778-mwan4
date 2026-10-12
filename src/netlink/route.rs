@@ -1269,16 +1269,11 @@ impl RouteManager {
                 FRA_TABLE => table = read_u32(data, 0)?,
                 FRA_PRIORITY => priority = read_u32(data, 0),
                 FRA_SRC if data.len() == 4 => {
-                    source = Some((
-                        Ipv4Addr::new(data[0], data[1], data[2], data[3]),
-                        src_len,
-                    ));
+                    source = Some((Ipv4Addr::new(data[0], data[1], data[2], data[3]), src_len));
                 }
                 FRA_DST if data.len() == 4 => {
-                    destination = Some((
-                        Ipv4Addr::new(data[0], data[1], data[2], data[3]),
-                        dst_len,
-                    ));
+                    destination =
+                        Some((Ipv4Addr::new(data[0], data[1], data[2], data[3]), dst_len));
                 }
                 FRA_FWMARK => mark = read_u32(data, 0),
                 FRA_FWMASK => mask = read_u32(data, 0),
