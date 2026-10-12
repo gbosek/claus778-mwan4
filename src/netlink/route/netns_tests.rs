@@ -780,18 +780,40 @@ fn netns_policy_routing() {
     // A firewall/PBR reload or external hotplug helper can remove our rule
     // without changing daemon memory. The periodic sync must inspect kernel
     // state and recreate the missing exception instead of trusting a cache.
-    assert!(sh(&["ip", "rule", "del", "pref", "9000", "protocol", "77"]));
+    assert!(sh(&["ip", "rule", "del", "pref", "9000"]));
     let removed = sh_out(&["ip", "rule", "show"]);
     assert!(
-        !removed.contains("fwmark 0x0/0xff0000"),
+        !removed
+            .lines()
+            .any(|line| line.trim_start().starts_with("9000:")),
         "test setup failed to remove the owned rule:\n{removed}"
     );
     rm.set_policy_rules(std::slice::from_ref(&masked))
         .expect("reconcile externally removed policy rule");
     let restored = sh_out(&["ip", "rule", "show"]);
     assert!(
-        restored.contains("fwmark 0x0/0xff0000 lookup 10001"),
+        restored.lines().any(|line| {
+            line.trim_start().starts_with("9000:")
+                && line.contains("from 192.168.9.0/24")
+                && line.contains("fwmark")
+                && line.contains("lookup 10001")
+        }),
         "missing owned rule was not restored from kernel state:\n{restored}"
+    );
+
+    let pbr_hit_after_restore = sh_out(&[
+        "ip",
+        "route",
+        "get",
+        "8.8.8.8",
+        "from",
+        "192.168.9.5",
+        "mark",
+        "0x10000",
+    ]);
+    assert!(
+        pbr_hit_after_restore.contains("dev mwp0"),
+        "restored PBR mark exemption did not win: {pbr_hit_after_restore}"
     );
 
     let native_hit = sh_out(&["ip", "route", "get", "8.8.8.8", "from", "192.168.9.5"]);
