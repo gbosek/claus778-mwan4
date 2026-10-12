@@ -1,0 +1,152 @@
+name: OpenWrt QEMU integration
+
+# VM tests run ONCE per pull request instead of twice on feature pushes
+# plus pull_request events. Manual dispatch remains available.
+on:
+  pull_request:
+    branches: [master]
+    paths:
+      - 'src/**'
+      - 'openwrt/**'
+      - 'tests/openwrt_vm.py'
+      - '.github/workflows/openwrt-vm.yml'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: openwrt-vm-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  openwrt-qemu:
+    name: ${{ matrix.label }} / PPPoE, DHCP, firewall4, PBR
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - family: openwrt
+            label: OpenWrt-24.10.5
+            image_url: https://downloads.openwrt.org/releases/24.10.5/targets/x86/64/openwrt-24.10.5-x86-64-generic-ext4-combined.img.gz
+            image_sha256: 5b854a7a2909a0b21887ba9be773b0964eb28fef81d6b8399d32a0f270a5d8ff
+            kernel_url: https://downloads.openwrt.org/releases/24.10.5/targets/x86/64/openwrt-24.10.5-x86-64-generic-kernel.bin
+            kernel_sha256: 2453476e27bcc5716e84ece27630c3e494e3d45a4d3240d55b7c3d630d3289c8
+          - family: immortalwrt
+            label: ImmortalWrt-6.18.52
+            # Pinned 2026-09-18 snapshot; fail closed if upstream changes.
+            image_url: https://downloads.immortalwrt.org/snapshots/targets/x86/64/immortalwrt-x86-64-generic-ext4-combined.img.gz
+            image_sha256: d743c20d5380006055792221df454cb27b4b0109dd212cafd1715b1ea99f0e42
+            kernel_url: https://downloads.immortalwrt.org/snapshots/targets/x86/64/immortalwrt-x86-64-generic-kernel.bin
+            kernel_sha256: 72303e0a86495e7d0fb74d70b66cbc384b79acf810b3d84ca18079a33ee1780d
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install QEMU and virtual WAN test services
+        timeout-minutes: 9
+        env:
+          DEBIAN_FRONTEND: noninteractive
+          NEEDRESTART_MODE: a
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/mwan4-vm-logs
+          # Bound APT and retain its logs: network mirrors can otherwise hang
+          # indefinitely before the guest is even booted.
+          for attempt in 1 2; do
+            echo "APT package index attempt $attempt"
+            if timeout --signal=TERM --kill-after=10s 180s \
+                sudo -E apt-get update -o Acquire::Retries=2 \
+                >/tmp/mwan4-vm-logs/apt-update.log 2>&1; then
+              break
+            fi
+            tail -n 50 /tmp/mwan4-vm-logs/apt-update.log
+            if [ "$attempt" -eq 2 ]; then exit 1; fi
+          done
+          timeout --signal=TERM --kill-after=10s 240s \
+            sudo -E apt-get install -y \
+            --no-install-recommends \
+            -o Dpkg::Options::=--force-confold \
+            -o Acquire::Retries=2 \
+            qemu-system-x86 qemu-utils iproute2 dnsmasq-base pppoe ppp python3-pexpect \
+            >/tmp/mwan4-vm-logs/apt-install.log 2>&1 || {
+              tail -n 120 /tmp/mwan4-vm-logs/apt-install.log
+              exit 1
+            }
+          command -v qemu-system-x86_64
+          command -v pppoe-server
+          python3 -c 'import pexpect; print("pexpect ready")'
+      - name: Compile Python VM harness before download
+        run: python3 -m py_compile tests/openwrt_vm.py
+      - name: Verify serial shell framing regression
+        run: python3 -m unittest discover -s tests -p test_openwrt_vm_serial.py -v
+      - name: Download pinned ${{ matrix.label }} x86_64 ext4 disk
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 4 --retry-delay 3 \
+            -o /tmp/openwrt.img.gz \
+            "${{ matrix.image_url }}"
+          printf '%s  %s\n' \
+            "${{ matrix.image_sha256 }}" \
+            /tmp/openwrt.img.gz | sha256sum --check
+          # The official combined image may have trailing non-gzip padding:
+          # GNU gzip exits 2 with a warning despite a verified SHA256 file.
+          # Require a complete zlib gzip member (eof), then ignore only tail.
+          python3 - <<'PY'
+          from pathlib import Path
+          import zlib
+          packed = Path('/tmp/openwrt.img.gz').read_bytes()
+          stream = zlib.decompressobj(wbits=31)
+          payload = stream.decompress(packed) + stream.flush()
+          assert stream.eof, 'incomplete gzip member'
+          assert len(payload) > 16 * 1024 * 1024, 'truncated OpenWrt image'
+          Path('/tmp/openwrt.img').write_bytes(payload)
+          print(f'OpenWrt image: {len(payload)} bytes; {len(stream.unused_data)} trailing padding bytes')
+          PY
+          # Boot the matching official kernel directly so /dev/console uses
+          # ttyS0, not VGA (which is noninteractive on headless Actions).
+          curl --fail --location --retry 4 --retry-delay 3 \
+            -o /tmp/openwrt-kernel.bin \
+            "${{ matrix.kernel_url }}"
+          printf '%s  %s\n' \
+            "${{ matrix.kernel_sha256 }}" \
+            /tmp/openwrt-kernel.bin | sha256sum --check
+      - name: Build actual Rust static binary
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: Compile release Rust executable
+        run: cargo build --locked --release --target x86_64-unknown-linux-musl
+      - name: Stage OpenWrt test payload without enabling package
+        run: |
+          mkdir -p /tmp/mwan4-vm-payload
+          install -m755 target/x86_64-unknown-linux-musl/release/mwan4 /tmp/mwan4-vm-payload/mwan4
+          cp openwrt/luci-app-mwan4/root/etc/init.d/mwan4 /tmp/mwan4-vm-payload/mwan4-init
+          cp openwrt/luci-app-mwan4/root/etc/config/mwan4 /tmp/mwan4-vm-payload/mwan4-uci
+          cp openwrt/mwan4-pbr-compat/files/usr/libexec/mwan4-pbr-compat /tmp/mwan4-vm-payload/pbr-compat
+          tar -cf /tmp/mwan4-vm-payload/pbr-adapter.tar -C openwrt/mwan4-pbr-compat/files lib/mwan4
+      - name: Stage pinned upstream PBR consumer API for strategy regression
+        run: |
+          git init /tmp/mwan4-pbr-upstream
+          git -C /tmp/mwan4-pbr-upstream fetch --depth 1 https://github.com/mossdef-org/pbr.git d462378320e5ae88dfe475964faa16f80f5f70cd
+          git -C /tmp/mwan4-pbr-upstream checkout --detach FETCH_HEAD
+          sed -i "s/version: 'dev-test'/version: '1.2.3-r101'/" /tmp/mwan4-pbr-upstream/files/lib/pbr/pkg.uc
+          tar -cf /tmp/mwan4-vm-payload/pbr-1.2.3.tar -C /tmp/mwan4-pbr-upstream/files etc/init.d/pbr lib/pbr
+      - name: Boot ${{ matrix.label }} and execute integration regression
+        timeout-minutes: 22
+        run: |
+          python3 tests/openwrt_vm.py \
+            --image /tmp/openwrt.img \
+            --kernel /tmp/openwrt-kernel.bin \
+            --distro ${{ matrix.family }} \
+            --payload /tmp/mwan4-vm-payload \
+            --output /tmp/mwan4-vm-logs
+      - name: Upload guest serial and WAN service logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-vm-logs-${{ matrix.family }}
+          path: /tmp/mwan4-vm-logs
+          if-no-files-found: ignore

@@ -134,6 +134,16 @@ pub struct PolicyConfig {
     pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
+/// Optional mossdef PBR consumer targets. Matching stays in PBR; route ownership
+/// and failover stay in this daemon. None means the current global ECMP route.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PbrTarget {
+    pub name: String,
+    pub mark: u32,
+    pub interface: Option<String>,
+}
+
 pub fn parse_ipv4_prefix(raw: &str) -> Result<(Ipv4Addr, u8), String> {
     let (addr, prefix) = raw
         .split_once('/')
@@ -293,6 +303,12 @@ pub struct DaemonConfig {
     /// 来源/目的策略分流规则（选填）；匹配的转发流量走指定 WAN，目标 WAN DOWN 时回退 ECMP。
     #[serde(default)]
     pub policies: Vec<PolicyConfig>,
+    /// Opt-in PBR packet mark mask. Native policies only match when masked mark bits are zero.
+    #[serde(default)]
+    pub policy_skip_mark_mask: Option<u32>,
+    /// Generated only by the opt-in PBR strategy adapter (IPv4).
+    #[serde(default)]
+    pub pbr_targets: Vec<PbrTarget>,
     /// WAN 接口配置列表
     pub interfaces: Vec<InterfaceConfig>,
     /// 未知栏位（以 `_` 开头者视为注解）；validate() 会拒绝真正的拼字错误。
@@ -411,6 +427,8 @@ impl Default for DaemonConfig {
             load_recover_ratio: default_load_recover_ratio(),
             allow_dynamic_weights_on_standard: false,
             policies: Vec::new(),
+            policy_skip_mark_mask: None,
+            pbr_targets: Vec::new(),
             interfaces: vec![
                 InterfaceConfig {
                     name: "wan1".to_string(),
@@ -458,6 +476,36 @@ impl DaemonConfig {
     pub fn validate(&self) -> Result<(), String> {
         if self.interfaces.is_empty() {
             return Err("At least one WAN interface must be configured".into());
+        }
+        if self.policy_skip_mark_mask == Some(0) {
+            return Err("policy_skip_mark_mask must be nonzero".into());
+        }
+        let mut target_names = std::collections::HashSet::new();
+        let mut target_marks = std::collections::HashSet::new();
+        if self.pbr_targets.len() > 63 {
+            return Err("at most 63 PBR adapter targets are supported".into());
+        }
+        for target in &self.pbr_targets {
+            if target.name.is_empty()
+                || target.name.len() > 64
+                || !target_names.insert(&target.name)
+            {
+                return Err("PBR target names must be unique and 1 ~ 64 characters".into());
+            }
+            if target.mark == 0
+                || target.mark & !crate::netlink::route::PBR_MARK_MASK != 0
+                || !target_marks.insert(target.mark)
+            {
+                return Err("PBR target marks must be unique, nonzero and within 0x3f00".into());
+            }
+            if let Some(iface) = &target.interface {
+                if !self.interfaces.iter().any(|i| &i.name == iface) {
+                    return Err(format!(
+                        "PBR target '{}' uses unknown interface '{iface}'",
+                        target.name
+                    ));
+                }
+            }
         }
         // 每张 WAN 会占用一个探针 slot（独立表＋oif 规则），slot 数有上限
         if self.interfaces.len() > crate::netlink::route::PROBE_SLOT_MAX as usize {
@@ -1220,6 +1268,39 @@ mod tests {
                 "应拒绝 target={target} recover={recover}"
             );
         }
+    }
+
+    #[test]
+    fn test_policy_skip_mark_mask_validation() {
+        let mut cfg = DaemonConfig::default();
+        cfg.policy_skip_mark_mask = Some(0x00ff0000);
+        assert!(cfg.validate().is_ok());
+        cfg.policy_skip_mark_mask = Some(0);
+        assert!(cfg.validate().is_err());
+        cfg.policy_skip_mark_mask = None;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_pbr_target_validation() {
+        let mut cfg = DaemonConfig::default();
+        cfg.pbr_targets = vec![PbrTarget {
+            name: "preferred".into(),
+            mark: 0x100,
+            interface: Some(cfg.interfaces[0].name.clone()),
+        }];
+        assert!(cfg.validate().is_ok());
+        for mark in [0, 0x10000, 0x101] {
+            cfg.pbr_targets[0].mark = mark;
+            assert!(cfg.validate().is_err());
+        }
+        cfg.pbr_targets[0].mark = 0x100;
+        cfg.pbr_targets[0].interface = Some("unknown".into());
+        assert!(cfg.validate().is_err());
+        cfg.pbr_targets[0].interface = None;
+        assert!(cfg.validate().is_ok(), "offline target uses global ECMP");
+        cfg.pbr_targets.push(cfg.pbr_targets[0].clone());
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

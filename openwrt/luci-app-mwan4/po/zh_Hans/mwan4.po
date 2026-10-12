@@ -154,8 +154,8 @@ msgid "Up Capacity (Mbps)"
 msgstr "上行容量（Mbps）"
 msgid "Upload (LAN upload) capacity for asymmetric lines. Leave empty to reuse the max bandwidth."
 msgstr "非对称线路的上传（LAN 上传）容量。留空则沿用最大带宽。"
-msgid "offloaded"
-msgstr "已转移"
+msgid "load shifting"
+msgstr "负载转移中"
 msgid "Policy Routing (Source / Destination)"
 msgstr "策略分流（来源 / 目的）"
 msgid "Send traffic matching a source (and optionally destination) prefix through a specific WAN using fib rules. Non-matching traffic keeps using ECMP. Rules are removed automatically while the target WAN is down, so traffic falls back to ECMP."
@@ -226,3 +226,15 @@ msgstr "合计速率"
 
 msgid "RTT Trend"
 msgstr "RTT 趋势"
+
+msgid "PBR Integration"
+msgstr "PBR 集成"
+
+msgid "Standalone PBR (default)"
+msgstr "独立 PBR（默认）"
+
+msgid "PBR strategy targets (IPv4)"
+msgstr "PBR 策略组目标（IPv4）"
+
+msgid "Optional. Strategy targets require mwan4-pbr-compat and PBR 1.2.3 with IPv6 policies disabled. Configure domain, port and device matches in PBR."
+msgstr "可选功能。策略组目标需要 mwan4-pbr-compat 和 PBR 1.2.3，并关闭 PBR 的 IPv6 策略。在 PBR 中配置域名、端口及设备匹配条件。"

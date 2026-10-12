@@ -1,5 +1,19 @@
 # MWAN4 (Multi-WAN 4)
 
+> **Development fork — do not install on a production router yet.**
+>
+> This branch defaults to disabled mwan4 with no preconfigured WAN interfaces.
+> Earlier upstream examples below (including `wan1/wan2`, offline
+> `dist/install.sh`, and manual service enable commands) are reference
+> examples, **not safe first-install instructions for this fork**.
+> `dist/install.sh` checked into this repository is intentionally disabled.
+> See [source audit](docs/REVIEW_2026-10-08.md) and
+> [generic OpenWrt integration](docs/GENERIC_OPENWRT.md).
+>
+> **Hardware offload compatibility is not guaranteed by ECMP**; check the
+> actual driver/PPE/NPU flow counters before claiming hardware acceleration.
+
+
 专为 Linux / OpenWrt 深度设计的极轻量、零负担、高性能「多 WAN 故障转移与健康监控守护进程（Daemon）」。
 
 用以彻底替代架构笨重、频繁呼叫 Shell 脚本、吃 CPU 且严重破坏硬体加速（Flow Offload）的传统 `mwan3`。
@@ -396,7 +410,7 @@ LuCI 的标题列也有「哈希粒度」徽章（`l4：按连线分散` / `仅 
 - `tx_bps` / `rx_bps`：即时速率（bit/s，取样自 `/sys/class/net/<if>/statistics`），
   用来看 ECMP 是否真的把流量分到多条线；
 - `effective_weight`：动态权重实际下发值；
-- `load_pct` / `offloaded`：负载利用率与是否正被下修；
+- `load_pct` / `load_shifted`：负载利用率与是否正被下修；
 - `policies[]`：每条政策的 `name` / `interface` / `priority` / `active`。
 
 另外有一个**顶层 `hash` 物件**，回报内核**实际生效**（读回，不是设定值）的多路径哈希：
@@ -486,8 +500,8 @@ ECMP 只按 flow 哈希，即使权重按频宽设好，也可能因为 flow 分
   预设 `auto` 在支援 nexthop object 的核心上直接生效（resilient 权重变更实测搬走 0%）；
   要强制在 standard 下使用请设 `allow_dynamic_weights_on_standard: true`。
 - **可观测**：状态档每条 WAN 多了 `load_pct`（利用率 %，未设容量时为 `null`）与
-  `offloaded`（目前是否因过载被下修）；LuCI 卡片会在速率后面显示
-  `(85%, offloaded)`，配合 `W:1 → 4` 就能确认分流正在转移。
+  `load_shifted`（目前是否因过载被下修；与 PPE/NPU 硬件卸载无关）；LuCI 卡片会在速率后面显示
+  `(85%, load shifting)`，配合 `W:1 → 4` 就能确认分流正在转移。
 
 > ⚠️ **本质限制：ECMP 是 per-flow 哈希，不能重分配「单一条大流量」。**
 > 权重只决定「新的 flow 落到哪」，已经建立连线不会无痛搬家。所以：
@@ -706,6 +720,8 @@ ssh root@192.168.1.1 "mwan4 --check-config /etc/mwan4/mwan4.json"
 > `route_priority` 刻意**不**在 UCI／LuCI 暴露：它必须与 netifd 自己那条 WAN 预设路由
 > 的 metric 一致（通常都是 0），守护进程才能接管预设路由；若设成非 0，netifd 那条
 > metric 较小的路由会永远胜出，故障转移也就不会生效。
+>
+> `interfaces[].metric` 是 **MWAN4 成员 metric**：相同值的成员组成 ECMP；不同值表示主备优先级，只有最低 metric 的在线成员参与 ECMP。daemon 与 `--check-config` 会在存在多个 metric 层级时发出提醒。它与 `/etc/config/network` 中 netifd 的 `network.<wan>.metric` 是两种不同设置。
 
 > 其余选填栏位（未列出者都有预设值）：
 > - `rtt_fail_count`（预设 3）：平滑 RTT 连续超标几次才判 DOWN。
@@ -961,7 +977,7 @@ underlay 走 DHCP 时，隧道只要绑定 `tunlink`（netifd 会在 WAN 变化�
    若是 `仅 L3：同一目的 IP 只走一条 WAN`，视频 CDN 的多条连线全部挤在一条线上——
    先把它改成 `l4`（见 §6.1），这一步解决绝大多数「两条线却只用到一条」的抱怨。
    要确认「真的分开了」，看 LuCI 卡片两条线的 `Throughput (TX / RX)` 是否都有流量。
-2. **一条线吃满、另一条闲置**：看 `load_pct` / `offloaded` 与 `W:1 → 4`。
+2. **一条线吃满、另一条闲置**：看 `load_pct` / `load_shifted` 与 `W:1 → 4`。
    前提是**每条 WAN 都设了 `max_mbps`**（容量比例）且 `load_aware: true`；
    注意 `standard` ECMP 下动态因子会被忽略，请用预设 `ecmp_mode: auto`（resilient）。
 3. **单一超大流量（单条 QUIC/TCP 串流）占满一条线**：ECMP 是 per-flow 哈希，

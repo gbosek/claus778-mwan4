@@ -1,5 +1,11 @@
 config global 'global'
-	option enabled '1'
+	# Optional PBR 1.2.3 consumer API: standalone (default) or mossdef.
+	# Requires mwan4-pbr-compat; see docs/PBR_COMPAT.md before enabling.
+	option pbr_mode 'standalone'
+	option enabled '0'
+	# Must be strictly lower than the metrics of netifd-installed default
+	# routes on participating WANs; start is refused on conflicts.
+	option route_priority '0'
 	option check_interval_ms '500'
 	option probe_timeout_ms '400'
 	option window_size '10'
@@ -17,7 +23,8 @@ config global 'global'
 	option flush_conntrack '1'
 	# 存活成员进出时是否清 conntrack（仅 standard ECMP 生效，主备模式只清新进成员）
 	option flush_conntrack_on_switch '1'
-	# 退出时是否删掉 mwan4 下发的预设路由。预设 0（保留），否则服务重启／升级窗口内整台路由器没有预设路由
+	# 保留内核退出清理的保守默认值；OpenWrt service_stopped 会
+	# 尝试从运行时快照恢复原有的 netifd IPv4/IPv6 默认路由。
 	option remove_routes_on_exit '0'
 	# standard: 单一 multipath 路由，成员/权重一变就重算整张 hash，实测连坐搬走 40%~43% 既有连线（换出口=换 NAT=断线），故非预设
 	# resilient: 内核 nexthop group（Linux 5.14+），只重映射故障成员 bucket（默认延后 120 秒）；auto（预设）优先 resilient，否则退回 standard
@@ -37,24 +44,20 @@ config global 'global'
 	option dynamic_weight_interval_ms '10000'
 	option dynamic_weight_min_ratio '0.25'
 
-config interface 'wan1'
-	option enabled '1'
-	option name 'wan1'
-	option gateway '192.168.1.1'
-	option metric '10'
-	option weight '1'
-	# 该线最大频宽（Mbps）：设定后 ECMP 基准权重 ∝ 最大频宽，也作 LAN 下载容量；up_mbps 为 LAN 上传方向（未填沿用 max）
-	list probe_targets '223.5.5.5:53'
-	list probe_targets '114.114.114.114:53'
-
-config interface 'wan2'
-	option enabled '1'
-	option name 'wan2'
-	option gateway '192.168.2.1'
-	option metric '10'
-	option weight '1'
-	list probe_targets '223.5.5.5:53'
-	list probe_targets '114.114.114.114:53'
+# No interfaces are preconfigured. On first installation this package will
+# NOT manage the default route; explicitly add WANs in LuCI and enable service.
+# Example (commented; the user must select their own existing logical WAN):
+# config interface 'uplink'
+#     option enabled '1'
+#     option network 'wan'
+#     # option network6 'wan6'   # optional if IPv6 uses a separate logical iface
+#     # option gateway6 'fe80::1' # normally discovered from netifd
+#     option metric '10'
+#     option weight '1'
+#     list probe_targets '1.1.1.1:53'
+#
+# Legacy/manual mode still accepts option name 'ethX'. On PPPoE interfaces
+# select option network instead of the underlying physical Ethernet device.
 
 # 策略分流：匹配来源（可选目的）的流量走指定 WAN，其余仍走 ECMP；目标 WAN DOWN 时规则自动移除。可有多个 config policy 段。
 # 例：#config policy 'guest' / list source '192.168.3.0/24' / list destination '10.0.0.0/8' / option interface 'wan2' / option priority '9000'

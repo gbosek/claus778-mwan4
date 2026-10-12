@@ -7,6 +7,167 @@ USE_PROCD=1
 PROG=/usr/bin/mwan4
 CONF_DIR=/var/etc
 CONF_FILE="$CONF_DIR/mwan4.json"
+# Route snapshots are runtime-only. Never persist another router's gateways
+# across reboots. Requires ip-full's binary "route save/restore" support.
+ROUTE_SNAPSHOT_DIR=/var/run/mwan4-route-backup
+
+# Snapshot current main-table defaults BEFORE the Rust daemon installs its
+# own proto-77 default route. Existing snapshots survive daemon reloads.
+snapshot_default_routes() {
+	local family snap tmp
+	mkdir -p "$ROUTE_SNAPSHOT_DIR" || return 1
+	chmod 700 "$ROUTE_SNAPSHOT_DIR" || return 1
+	for family in 4 6; do
+		snap="$ROUTE_SNAPSHOT_DIR/default$family.bin"
+		[ -e "$snap" ] && continue
+		# IPv4-only OpenWrt kernels may not support any IPv6 route calls.
+		[ "$family" = 6 ] && ! ip -6 route show table main >/dev/null 2>&1 && continue
+		# A leftover mwan4 route is not an original netifd route. Refuse to
+		# snapshot it, as restoring it would recreate stale ECMP nexthops.
+		if ip "-$family" route show table main default proto 77 | grep -q .; then
+			logger -t mwan4 "Skipping IPv$family snapshot: mwan4 route already present"
+			continue
+		fi
+		tmp="$snap.tmp.$$"
+		if ! ip "-$family" route save table main default > "$tmp"; then
+			rm -f "$tmp"
+			logger -t mwan4 "IPv$family default route snapshot failed (ip-full required)"
+			return 1
+		fi
+		mv -f "$tmp" "$snap" || return 1
+	done
+}
+
+# Fail safe if the new ECMP default metric collides with or ranks below
+# a netifd default. We never replace a same-metric route owned by the OS,
+# and a worse metric would leave mwan4 ineffectual while reporting "up".
+# An IPv6 default is often metric 1024; the same rule applies per family.
+verify_default_route_metric() {
+	local managed_metric="$1" family rows
+	for family in 4 6; do
+		if [ "$family" = 6 ] && ! ip -6 route show table main >/dev/null 2>&1; then
+			continue
+		fi
+		rows="$(ip "-$family" -o route show table main default)" || return 1
+		[ -n "$rows" ] || continue
+		if printf '%s\n' "$rows" | awk -v chosen="$managed_metric" '
+		{
+			metric=0; owned=0;
+			for (i=1; i<=NF; i++) {
+				if ($i=="metric" && i<NF) metric=$(i+1);
+				if ($i=="proto" && i<NF && ($(i+1)=="77" || $(i+1)=="mwan4")) owned=1;
+			}
+			if (!owned && metric <= chosen) { print; failure=1; }
+		}
+		END { exit failure?0:1 }'; then
+			logger -t mwan4 "IPv$family default route metric conflicts with mwan4 metric $managed_metric: configure existing WAN default route metrics higher, leaving networking untouched"
+			return 1
+		fi
+	done
+	return 0
+}
+
+# Called by rc.common after procd_kill has stopped the daemon.
+# Only touch default routes identified as mwan4 proto-77. Do not flush
+# main-table LAN routes, PBR tables, IP rules, or conntrack on service stop.
+restore_default_routes() {
+	local family snap size owned_routes previous_routes cleanup_failed
+	for family in 4 6; do
+		snap="$ROUTE_SNAPSHOT_DIR/default$family.bin"
+		# Even without a saved original default, a user-requested stop
+		# must clean up mwan4-owned routes. Do not touch non-owned routes.
+		cleanup_failed=0
+		while :; do
+			owned_routes="$(ip "-$family" route show table main default proto 77 2>/dev/null)" || {
+				logger -t mwan4 "IPv$family: could not inspect owned proto-77 route; leaving snapshot"
+				cleanup_failed=1
+				break
+			}
+			[ -n "$owned_routes" ] || break
+			previous_routes="$owned_routes"
+			if ! ip "-$family" route del table main default proto 77; then
+				logger -t mwan4 "IPv$family: could not remove owned proto-77 route; leaving snapshot"
+				cleanup_failed=1
+				break
+			fi
+			owned_routes="$(ip "-$family" route show table main default proto 77 2>/dev/null)" || {
+				logger -t mwan4 "IPv$family: could not verify proto-77 route cleanup; leaving snapshot"
+				cleanup_failed=1
+				break
+			}
+			if [ "$owned_routes" = "$previous_routes" ]; then
+				logger -t mwan4 "IPv$family: proto-77 route remained after delete; leaving snapshot"
+				cleanup_failed=1
+				break
+			fi
+		done
+		[ "$cleanup_failed" -eq 0 ] || continue
+		[ -f "$snap" ] || continue
+		size="$(wc -c < "$snap" 2>/dev/null)" || continue
+		if [ "$size" -le 4 ]; then
+			# The original route table did not contain a default.
+			logger -t mwan4 "IPv$family had no original default; netifd owns recovery"
+			rm -f "$snap"
+			continue
+		fi
+		# Prefer CURRENT netifd state. A saved DHCP/PPPoE gateway may be
+		# obsolete after a renew or redial and must not be replayed.
+		if ip "-$family" route show table main default | grep -q .; then
+			logger -t mwan4 "IPv$family current default exists; discarding older snapshot"
+			rm -f "$snap"
+		elif ip "-$family" route restore < "$snap"; then
+			logger -t mwan4 "IPv$family emergency route snapshot restored"
+			rm -f "$snap"
+		else
+			logger -t mwan4 "IPv$family restore failed; check current netifd state; keeping snapshot"
+		fi
+	done
+	rmdir "$ROUTE_SNAPSHOT_DIR" 2>/dev/null || :
+}
+
+service_stopped() {
+	# SIGKILL cannot run Rust's shutdown cleanup. Clear only adapter rules
+	# carrying our protocol marker in our reserved band; never flush PBR's
+	# standalone rules. Keep nft chains so existing PBR goto targets stay valid.
+	if [ -f "$CONF_DIR/mwan4-pbr.json" ]; then
+		local priorities priority
+		priorities="$(ip -4 rule show protocol 77 2>/dev/null | awk -F: '$1>=8000 && $1<8126 {print $1}')"
+		for priority in $priorities; do
+			ip -4 rule del pref "$priority" protocol 77 || logger -t mwan4 "Could not remove adapter rule $priority"
+		done
+	fi
+	restore_default_routes
+}
+
+service_started() {
+	# rc.common's rc_procd closes its request after calling start_service,
+	# which can hide that callback's return code. Keep our result explicitly.
+	[ "${MWAN4_START_RC:-1}" -eq 0 ] || return 1
+	[ "${MWAN4_START_READY:-0}" -eq 1 ] || return 0
+	local pbr_mode
+	config_get pbr_mode global pbr_mode standalone
+	if [ "$pbr_mode" = mossdef ] && [ -x /etc/init.d/pbr ]; then
+		# PBR starts earlier at boot. Publish consumer chains/manifest first,
+		# then ask enabled PBR to resolve its targets against the new mapping.
+		(/etc/init.d/pbr reload > "$CONF_DIR/mwan4-pbr/reload.log" 2>&1) &
+	fi
+	return 0
+}
+
+# rc.common's default procd reload calls start_service() directly; it does
+# NOT call service_stopped(). With changing PPPoE netdevs that may leave
+# a stale proto-77 route if the new configuration has zero active WANs.
+# The lock is already held by rc.common's reload() wrapper. Do not call
+# /etc/init.d/mwan4 stop/restart here (that would recurse on procd_lock).
+reload_service() {
+	local base="${basescript:-$initscript}" daemon
+	daemon="${base##*/}"
+	procd_kill "$daemon"
+	service_stopped
+	rc_procd start_service || return 1
+	service_started
+}
+
 
 # UCI 值直接拼进 JSON，有写入权限者（rpcd ACL 开放）可用引号/反斜线/换行注入栏位，故字串一律转义、数字一律先验证
 json_escape() {
@@ -38,9 +199,9 @@ is_decimal() {
 generate_json_config() {
 	mkdir -p "$CONF_DIR"
 
-	local enabled check_interval probe_timeout window_size loss_down degrade_loss degrade_hysteresis degrade_exit degrade_enter degrade_min_out fail_down recovery max_rtt flush_ct flush_switch ecmp_mode remove_routes dyn_standard_ok
+	local enabled check_interval probe_timeout window_size loss_down degrade_loss degrade_hysteresis degrade_exit degrade_enter degrade_min_out fail_down recovery max_rtt flush_ct flush_switch ecmp_mode remove_routes dyn_standard_ok route_priority
 	# 未设定即视为启用（与 LuCI 预设一致，也让忘记写 enabled 不会静默不启动）
-	config_get_bool enabled global enabled 1
+	config_get_bool enabled global enabled 0
 	[ "$enabled" -eq 1 ] || return 1
 
 	config_get check_interval global check_interval_ms 500
@@ -62,6 +223,11 @@ generate_json_config() {
 	# 成员进出时是否清 conntrack（仅 standard ECMP 生效；主备模式下只清新进成员）
 	config_get_bool flush_switch global flush_conntrack_on_switch 1
 	config_get ecmp_mode global ecmp_mode auto
+	config_get route_priority global route_priority 0
+	if ! is_uint "$route_priority"; then
+		logger -t mwan4 "Invalid global route_priority: $route_priority"
+		return 1
+	fi
 	# 退出时是否删预设路由。预设 0：删掉唯一预设路由会在重启窗口内让路由器失去出口，且启动失败时无法自行恢复
 	config_get_bool remove_routes global remove_routes_on_exit 0
 
@@ -158,14 +324,49 @@ generate_json_config() {
 		return 1
 	fi
 
+	# Optional PBR addon: allow PBR-marked packets to pass through native
+	# source/destination policies and reach PBR's own later fwmark rules.
+	# The base package never installs, starts, or changes PBR.
+	local pbr_skip_mask_json="null" pbr_mask pbr_enabled
+	if [ -x /usr/libexec/mwan4-pbr-compat ] && [ -f /etc/config/pbr ] && command -v uci >/dev/null 2>&1; then
+		pbr_enabled="$(uci -q get pbr.config.enabled 2>/dev/null || :)"
+		case "$pbr_enabled" in yes|on|true) pbr_enabled=1 ;; esac
+		if [ "$pbr_enabled" -gt 0 ] 2>/dev/null; then
+			pbr_mask="$(uci -q get pbr.config.fw_mask 2>/dev/null || :)"
+			[ -n "$pbr_mask" ] || pbr_mask="00ff0000"
+			if ! printf '%s' "$pbr_mask" | grep -Eq '^[[:xdigit:]]{8}$'; then
+				logger -t mwan4 "Invalid PBR fw_mask; cannot safely exclude marked flows"
+				return 1
+			fi
+			pbr_skip_mask_json="$(printf '%d' "0x$pbr_mask" 2>/dev/null)" || return 1
+			if [ "$pbr_skip_mask_json" = "0" ]; then
+				logger -t mwan4 "PBR fw_mask must be nonzero"
+				return 1
+			fi
+		fi
+	fi
+
 	# 策略分流规则（可多个 config policy 段）；字串转义、priority 验证，更细格式（CIDR）交给 daemon --check-config
 	local policies_json="" policy_invalid=0
 	handle_policy() {
 		local section="$1"
-		local p_name p_interface p_priority
+		local p_name p_interface p_priority target_network target_device
 		config_get p_name "$section" name "$section"
 		config_get p_interface "$section" interface ""
 		config_get p_priority "$section" priority ""
+		# LuCI policies select UCI WAN sections, whereas the Rust daemon
+		# expects a live kernel netdev. Preserve old raw-device values.
+		config_get target_network "$p_interface" network ""
+		config_get target_device "$p_interface" name "$p_interface"
+		if [ -n "$target_network" ]; then
+			if ! command -v network_get_device >/dev/null 2>&1 || \
+			   ! network_get_device target_device "$target_network" || \
+			   [ -z "$target_device" ]; then
+				logger -t mwan4 "policy '$section': WAN '$p_interface' is not active; deferring rule"
+				return 0
+			fi
+		fi
+		p_interface="$target_device"
 		if [ -z "$p_name" ] || [ -z "$p_interface" ]; then
 			logger -t mwan4 "policy '$section': name and interface are required"
 			policy_invalid=1
@@ -243,6 +444,7 @@ generate_json_config() {
 	  "recovery_success_count": $recovery,
 	  "max_rtt_ms": $max_rtt,
 	  "ecmp_mode": "$ecmp_mode_json",
+	  "route_priority": $route_priority,
 	  "multipath_hash_policy": $hash_policy_json,
 	  "weight_mode": "$weight_mode_json",
 	  "dynamic_weight_interval_ms": $dyn_interval,
@@ -251,6 +453,7 @@ generate_json_config() {
 	  "load_target_ratio": $load_target,
 	  "load_recover_ratio": $load_recover,
 	  "allow_dynamic_weights_on_standard": $dyn_standard_str,
+	  "policy_skip_mark_mask": $pbr_skip_mask_json,
 	  "policies": [ $policies_json ],
 	  "flush_conntrack_on_down": $flush_str,
 	  "flush_conntrack_on_switch": $flush_switch_str,
@@ -262,12 +465,56 @@ generate_json_config() {
 	local invalid_iface=0
 	handle_interface() {
 		local section="$1"
-		local if_enabled name gateway metric weight
+		local if_enabled name gateway gateway6 metric weight network_iface network_iface6 resolved_name resolved_name6
 		config_get_bool if_enabled "$section" enabled 1
 		[ "$if_enabled" -eq 1 ] || return 0
 
-		config_get name "$section" name "$section"
+		# Resolve OpenWrt logical interfaces via netifd on each daemon
+		# start/reload; never persist a transient PPPoE device name.
+		config_get network_iface "$section" network ""
+		config_get name "$section" name ""
 		config_get gateway "$section" gateway ""
+		config_get gateway6 "$section" gateway6 ""
+		config_get network_iface6 "$section" network6 ""
+		if [ -n "$network_iface" ]; then
+			case "$network_iface" in
+				*[!a-zA-Z0-9_.-]*)
+					logger -t mwan4 "section '$section': invalid network interface name"
+					invalid_iface=1
+					return 0
+					;;
+			esac
+			if ! command -v network_get_device >/dev/null 2>&1 || \
+			   ! network_get_device resolved_name "$network_iface" || \
+			   [ -z "$resolved_name" ] || \
+			   { command -v network_is_up >/dev/null 2>&1 && ! network_is_up "$network_iface"; }; then
+				# Never fall back to PPPoE's physical Ethernet carrier.
+				logger -t mwan4 "section '$section': network '$network_iface' has no L3 device; waiting for netifd"
+				return 0
+			fi
+			name="$resolved_name"
+			if [ -z "$gateway" ]; then
+				network_get_gateway gateway "$network_iface" 2>/dev/null || gateway=""
+			fi
+		fi
+		# For dual-stack WANs, network6 may be a separate netifd logical
+		# interface (e.g. wan6). The kernel L3 device must be identical.
+		[ -n "$network_iface6" ] || network_iface6="$network_iface"
+		if [ -z "$gateway6" ] && [ -n "$network_iface6" ]; then
+			if command -v network_get_device >/dev/null 2>&1 && \
+			   network_get_device resolved_name6 "$network_iface6" && \
+			   [ "$resolved_name6" = "$name" ] && \
+			   { ! command -v network_is_up >/dev/null 2>&1 || network_is_up "$network_iface6"; }; then
+				network_get_gateway6 gateway6 "$network_iface6" 2>/dev/null || gateway6=""
+			else
+				logger -t mwan4 "section '$section': IPv6 network '$network_iface6' inactive or L3 device mismatch; IPv6 ECMP disabled on this WAN"
+			fi
+		fi
+		if [ -z "$name" ]; then
+			logger -t mwan4 "section '$section': choose 'option network' or 'option name'"
+			invalid_iface=1
+			return 0
+		fi
 		config_get metric "$section" metric 10
 		config_get weight "$section" weight 1
 
@@ -301,11 +548,16 @@ generate_json_config() {
 			up_json="$up_mbps"
 		fi
 
-		local name_json gw_json
+		local name_json gw_json gw6_json
 		name_json="$(json_escape "$name")"
 		gw_json="null"
+		gw6_json="null"
 		if [ -n "$gateway" ] && [ "$gateway" != "0.0.0.0" ]; then
 			gw_json="\"$(json_escape "$gateway")\""
+		fi
+		if [ -n "$gateway6" ] && [ "$gateway6" != "::" ]; then
+			# The Rust --check-config validates the IPv6 address.
+			gw6_json="\"$(json_escape "$gateway6")\""
 		fi
 
 		local target_json=""
@@ -385,6 +637,7 @@ generate_json_config() {
 		    {
 		      "name": "$name_json",
 		      "gateway": $gw_json,
+		      "gateway6": $gw6_json,
 		      "metric": $metric,
 		      "weight": $weight,
 		      "max_mbps": $max_json,
@@ -406,7 +659,7 @@ generate_json_config() {
 	# 无 interface 段时不可产生 {"interfaces": []}：那会让 daemon 在 validate() 失败退出、被 procd 无限重启
 	if [ "$first" -eq 1 ]; then
 		rm -f "$CONF_FILE"
-		logger -t mwan4 "No WAN interface defined in /etc/config/mwan4, refusing to start"
+		logger -t mwan4 "No active configured WAN interfaces; routing left untouched"
 		return 1
 	fi
 
@@ -415,25 +668,77 @@ generate_json_config() {
 	}
 	EOF
 
+	local pbr_mode
+	config_get pbr_mode global pbr_mode standalone
+	case "$pbr_mode" in
+		standalone) ;;
+		mossdef)
+			if [ ! -f /lib/mwan4/pbr-prepare.uc ] || [ ! -x /usr/libexec/mwan4-pbr-compat ] || ! command -v ucode >/dev/null 2>&1; then
+				logger -t mwan4 "mossdef PBR mode requires the optional mwan4-pbr-compat package"
+				return 1
+			fi
+			/usr/libexec/mwan4-pbr-compat check-mark-owner || return 1
+			# Private runtime state, never inherit symlinks in a shared /tmp.
+			mkdir -p "$CONF_DIR/mwan4-pbr" || return 1
+			chmod 700 "$CONF_DIR/mwan4-pbr" || return 1
+			ucode -S -L /lib/mwan4 /lib/mwan4/pbr-prepare.uc \
+				"$CONF_FILE" "$CONF_DIR/mwan4-pbr/manifest.json" "$CONF_DIR/mwan4-pbr/rules.nft" || return 1
+			;;
+		*) logger -t mwan4 "Unknown pbr_mode '$pbr_mode'"; return 1 ;;
+	esac
+
 	return 0
 }
 
 start_service() {
+	MWAN4_START_RC=1
+	MWAN4_START_READY=0
+	# Query netifd's live L3 devices and gateways, especially for PPPoE.
+	[ -f /lib/functions/network.sh ] && . /lib/functions/network.sh
 	[ -x "$PROG" ] || {
 		logger -t mwan4 "Binary $PROG not executable or not installed"
 		return 1
 	}
 
 	config_load mwan4
+	local enabled
+	config_get_bool enabled global enabled 0
+	if [ "$enabled" -ne 1 ]; then MWAN4_START_RC=0; return 0; fi
 	generate_json_config || {
-		logger -t mwan4 "mwan4 is disabled or has no WAN interface configured, not starting"
-		return 0
+		logger -t mwan4 "Invalid or unavailable WAN/PBR configuration, not starting"
+		return 1
 	}
 
-	# 产生 JSON 后先 --check-config 自我验证（仅验证不启动）；此时尚未 procd_open_instance，return 1 不会产生重启回圈
+	# Validate before taking a route snapshot or starting the daemon.
 	if ! "$PROG" --check-config "$CONF_FILE"; then
 		logger -t mwan4 "Generated config $CONF_FILE failed --check-config, aborting start"
 		return 1
+	fi
+	# Do not hijack netifd's existing lower/equal-metric default routes.
+	local configured_metric
+	config_get configured_metric global route_priority 0
+	if ! verify_default_route_metric "$configured_metric"; then
+		return 1
+	fi
+	# iproute2 is required here; a failed snapshot must never silently
+	# proceed to overwrite the router's only existing default gateway.
+	if ! snapshot_default_routes; then
+		logger -t mwan4 "Refusing to manage routes without a recovery snapshot"
+		return 1
+	fi
+
+	local pbr_mode
+	config_get pbr_mode global pbr_mode standalone
+	if [ "$pbr_mode" = mossdef ]; then
+		# nft batches are atomic. The same idempotent batch survives fw4
+		# reloads before PBR's 30-pbr.nft is loaded. PBR owns its match rules.
+		if ! nft -f "$CONF_DIR/mwan4-pbr/rules.nft"; then
+			logger -t mwan4 "PBR adapter nft batch failed; daemon was not started"
+			return 1
+		fi
+		mkdir -p /usr/share/nftables.d/ruleset-post || return 1
+		cp "$CONF_DIR/mwan4-pbr/rules.nft" /usr/share/nftables.d/ruleset-post/25-mwan4-pbr.nft || return 1
+		cp "$CONF_DIR/mwan4-pbr/manifest.json" "$CONF_DIR/mwan4-pbr.json" || return 1
 	fi
 
 	procd_open_instance
@@ -444,8 +749,22 @@ start_service() {
 	procd_set_param file /etc/config/mwan4
 	procd_close_instance
 	logger -t mwan4 "mwan4 service started with $CONF_FILE"
+	MWAN4_START_RC=0
+	MWAN4_START_READY=1
+	return 0
+}
+
+_mwan4_netifd_trigger() {
+	local section="$1" network_iface network_iface6
+	config_get network_iface "$section" network ""
+	config_get network_iface6 "$section" network6 ""
+	[ -n "$network_iface" ] && procd_add_reload_interface_trigger "$network_iface"
+	[ -n "$network_iface6" ] && [ "$network_iface6" != "$network_iface" ] && \
+		procd_add_reload_interface_trigger "$network_iface6"
 }
 
 service_triggers() {
-	procd_add_reload_trigger "mwan4"
+	procd_add_reload_trigger "mwan4" "network" "pbr"
+	config_load mwan4
+	config_foreach _mwan4_netifd_trigger interface
 }

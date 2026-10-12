@@ -253,7 +253,7 @@ function rateText(iface) {
 	var text = '\u2191 ' + formatRate(iface.tx_bps) + '  \u2193 ' + formatRate(iface.rx_bps);
 	if (iface.load_pct !== undefined && iface.load_pct !== null) {
 		text += '  (' + iface.load_pct.toFixed(0) + '%';
-		if (iface.offloaded) text += ', ' + _('offloaded');
+		if (iface.load_shifted) text += ', ' + _('load shifting');
 		text += ')';
 	}
 	return text;
@@ -1099,14 +1099,14 @@ return view.extend({
 		poll.add(this.pollFn, 5);
 
 		m = new form.Map('mwan4', _('MWAN4 Configuration'),
-			_('Multi-WAN interfaces and health probes via UCI. Save & Apply reloads the daemon.'));
+			_('Disabled until configured: add your own network interfaces and enable the daemon when ready. No fixed number of WANs is required.'));
 
 		s = m.section(form.NamedSection, 'global', 'global', _('Global Settings'));
 		s.tab('basic', _('Basic'));
 		s.tab('advanced', _('Advanced'));
 
 		o = s.taboption('basic', form.Flag, 'enabled', _('Enable MWAN4 Daemon'));
-		o.default = o.enabled;
+		o.default = o.disabled;
 		o.rmempty = false;
 
 		o = s.taboption('basic', form.Value, 'check_interval_ms', _('Probe Interval (ms)'),
@@ -1145,6 +1145,13 @@ return view.extend({
 		o.value('auto', _('Automatic (resilient when supported)'));
 		o.value('resilient', _('Resilient nexthop group (require kernel support)'));
 		o.default = 'auto';
+		o.rmempty = false;
+
+		o = s.taboption('advanced', form.ListValue, 'pbr_mode', _('PBR Integration'),
+			_('Optional. Strategy targets require mwan4-pbr-compat and PBR 1.2.3 with IPv6 policies disabled. Configure domain, port and device matches in PBR.'));
+		o.value('standalone', _('Standalone PBR (default)'));
+		o.value('mossdef', _('PBR strategy targets (IPv4)'));
+		o.default = 'standalone';
 		o.rmempty = false;
 
 		o = s.taboption('advanced', form.Value, 'degrade_loss_threshold', _('Degrade Loss Threshold'));
@@ -1197,23 +1204,43 @@ return view.extend({
 		o.default = o.enabled;
 		o.editable = true;
 
-		o = s.option(form.Value, 'name', _('Interface Name'));
-		o.rmempty = false;
+		o = s.option(form.ListValue, 'network', _('OpenWrt Logical WAN'),
+			_('Select the OpenWrt network interface. The live L3 device and gateway are resolved by netifd, including after PPPoE redial.'));
+		o.value('', _('Manual device (advanced)'));
+		uci.sections('network', 'interface').forEach(function(sec) {
+			if (sec['.name'] && sec['.name'] !== 'loopback' &&
+			    sec['.name'] !== 'lan' && sec.proto !== 'none')
+				o.value(sec['.name'], sec['.name']);
+		});
+		o.rmempty = true;
 		o.editable = true;
-		if (netdevs.length) {
-			netdevs.forEach(function(dev) {
-				o.value(dev);
-			});
-		} else {
-			uci.sections('network', 'interface').forEach(function(sec) {
-				if (sec['.name'] && sec['.name'] !== 'loopback' && sec['.name'] !== 'lan')
-					o.value(sec['.name']);
-			});
-		}
 
-		o = s.option(form.Value, 'gateway', _('Gateway IP'));
+		o = s.option(form.Value, 'name', _('Manual Linux Device'),
+			_('Only needed without a logical network selection. The selected network takes precedence.'));
+		o.rmempty = true;
+		o.editable = true;
+		netdevs.forEach(function(dev) { o.value(dev); });
+
+		o = s.option(form.Value, 'gateway', _('IPv4 Gateway (optional)'),
+			_('Leave empty to use the dynamic netifd gateway; PPPoE normally needs no explicit gateway.'));
 		o.datatype = 'ip4addr';
-		o.rmempty = false;
+		o.rmempty = true;
+		o.editable = true;
+
+		o = s.option(form.ListValue, 'network6', _('IPv6 Logical Interface (optional)'),
+			_('Select a separate IPv6 netifd interface (e.g. wan6) if it shares the same L3 device; otherwise use the IPv4 WAN interface.'));
+		o.value('', _('Same as IPv4 WAN'));
+		uci.sections('network', 'interface').forEach(function(sec) {
+			if (sec['.name'] && sec['.name'] !== 'loopback')
+				o.value(sec['.name'], sec['.name']);
+		});
+		o.rmempty = true;
+		o.editable = true;
+
+		o = s.option(form.Value, 'gateway6', _('IPv6 Gateway (optional)'),
+			_('Normally detected from netifd; only WANs with an IPv6 gateway participate in IPv6 ECMP. Use manual value for advanced setups.'));
+		o.datatype = 'ip6addr';
+		o.rmempty = true;
 		o.editable = true;
 
 		o = s.option(form.Value, 'metric', _('Metric (Priority)'),
@@ -1263,7 +1290,8 @@ return view.extend({
 		o.rmempty = false;
 		o.editable = true;
 		uci.sections('mwan4', 'interface').forEach(function(sec) {
-			if (sec.name) o.value(sec.name, sec.name);
+			if (sec['.name'])
+				o.value(sec['.name'], sec.network || sec.name || sec['.name']);
 		});
 
 		o = s.option(form.Value, 'priority', _('Rule Priority'));

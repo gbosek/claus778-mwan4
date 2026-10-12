@@ -90,15 +90,17 @@ pub const MAX_NEXTHOP_WEIGHT: u32 = 255;
 
 // 探针专用路由表 / 规则（RTM_NEWRULE）：SO_BINDTODEVICE 只固定 oif，故每张 WAN 建独立表 + oif 规则让探针必有路。
 
-/// RTM_NEWRULE/RTM_DELRULE = 32/33（不是 21/22，那是 RTM_DELADDR/GETADDR）。
+/// RTM_NEWRULE/DELRULE/GETRULE = 32/33/34（不是 21/22，那是 address message）。
 pub const RTM_NEWRULE: u16 = 32;
 pub const RTM_DELRULE: u16 = 33;
+pub const RTM_GETRULE: u16 = 34;
 
 /// enum fib_rule_attr（照 linux/rtnetlink.h 抄：FWMARK=10, TABLE=15, FWMASK=16, OIFNAME=17）
 pub const FRA_PRIORITY: u16 = 6;
 pub const FRA_IIFNAME: u16 = 3;
 pub const FRA_OIFNAME: u16 = 17;
 pub const FRA_TABLE: u16 = 15;
+pub const FRA_SUPPRESS_PREFIXLEN: u16 = 14;
 /// 规则来源标记（u8）：清扫只删带此标记的规则，不动 mwan3/VPN 的规则。
 pub const FRA_PROTOCOL: u16 = 21;
 
@@ -119,11 +121,18 @@ pub const PROBE_SLOT_MAX: u32 = 64;
 
 /// 策略规则的优先序起点（第 i 条用 POLICY_RULE_PRIORITY_BASE + i）
 pub const POLICY_RULE_PRIORITY_BASE: u32 = 9_000;
+/// Optional PBR adapter uses mwan3/mossdef's mark range, separate from PBR's
+/// standalone 0x00ff0000 mask. Two rules per target protect connected routes.
+pub const PBR_MARK_MASK: u32 = 0x3f00;
+pub const PBR_RULE_PRIORITY_BASE: u32 = 8_000;
+pub const PBR_RULE_SLOT_MAX: u32 = 126;
 /// 策略规则数量上限（含来源/目的展开后的总条数）
 pub const POLICY_SLOT_MAX: u32 = 64;
 /// enum fib_rule_attr：来源/目的前缀
 pub const FRA_DST: u16 = 1;
 pub const FRA_SRC: u16 = 2;
+pub const FRA_FWMARK: u16 = 10;
+pub const FRA_FWMASK: u16 = 16;
 /// 探针目标主表 /32 的 metric；与预设路由 priority 分开才能精准辨识删除。
 pub const PROBE_MAIN_ROUTE_METRIC: u32 = 42_760;
 
@@ -378,6 +387,12 @@ pub struct PolicyRule {
     pub source: Option<(Ipv4Addr, u8)>,
     /// 目的前缀（None = 不限制）
     pub destination: Option<(Ipv4Addr, u8)>,
+    /// When set, exclude packets selected by the PBR mark mask.
+    pub skip_mark_mask: Option<u32>,
+    /// Exact masked match for an optional PBR consumer target.
+    pub match_mark: Option<(u32, u32)>,
+    /// Consult main for connected/specific routes before a WAN default.
+    pub suppress_default: bool,
 }
 
 /// 一条 fib_rule 的描述（出向用 oif、入向用 iif）
@@ -447,8 +462,6 @@ pub struct RouteManager {
     probe_paths: std::collections::HashMap<String, ProbePath>,
     /// 已下发的隧道 underlay /32：对端位址 -> (ifindex, gateway)；用来差异比对，避免每轮重下。
     underlay_routes: std::collections::HashMap<Ipv4Addr, (u32, Option<Vec<u8>>)>,
-    /// 已下发的策略分流规则（差异比对与清理用）
-    policy_rules: Vec<PolicyRule>,
     /// 上一次真正下发到核心的 nexthop 集合（含权重）。用来跳过「内容完全一样」的 FIB 重下：
     /// 探针路径每 48 秒的周期刷新、以及单成员时的权重变更，都会走到同一条下发路径，
     /// 实测让核心每分钟重下 5 次完全相同的预设路由（RIB 上是等价替换，纯粹是噪声）。
@@ -530,7 +543,6 @@ impl RouteManager {
                 installed_v6: InstalledVariant::None,
                 probe_paths: std::collections::HashMap::new(),
                 underlay_routes: std::collections::HashMap::new(),
-                policy_rules: Vec::new(),
                 last_hops_v4: Vec::new(),
                 last_hops_v6: Vec::new(),
                 last_active_v4: Vec::new(),
@@ -551,7 +563,6 @@ impl RouteManager {
                 installed_v6: InstalledVariant::None,
                 probe_paths: std::collections::HashMap::new(),
                 underlay_routes: std::collections::HashMap::new(),
-                policy_rules: Vec::new(),
                 last_hops_v4: Vec::new(),
                 last_hops_v6: Vec::new(),
                 last_active_v4: Vec::new(),
@@ -1018,42 +1029,70 @@ impl RouteManager {
         if let Some((addr, _)) = rule.destination {
             Self::append_attr(&mut buffer, FRA_DST, &addr.octets());
         }
+        if let Some((mark, mask)) = rule
+            .match_mark
+            .or(rule.skip_mark_mask.map(|mask| (0, mask)))
+        {
+            Self::append_attr(&mut buffer, FRA_FWMARK, &mark.to_ne_bytes());
+            Self::append_attr(&mut buffer, FRA_FWMASK, &mask.to_ne_bytes());
+        }
+        if rule.suppress_default {
+            Self::append_attr(&mut buffer, FRA_SUPPRESS_PREFIXLEN, &0u32.to_ne_bytes());
+        }
         Self::append_attr(&mut buffer, FRA_PROTOCOL, &[PROBE_RULE_PROTOCOL]);
 
         Self::finish_msg(&mut buffer, msg_type, flags, seq);
         buffer
     }
 
-    /// 同步策略分流规则：差异比对（不做全量重下），避免无谓的 netlink 往返与规则闪断。
+    /// 同步策略分流规则，以内核实际状态为准。
+    ///
+    /// netifd、PBR 或 fw4 reload 可能清掉规则，但不会更新本进程缓存；只比较缓存会让
+    /// “心跳重下”漏掉缺失规则。每次同步先 dump 规则，只保留本程序协议标记和优先序保留区，
+    /// 然后删除过期项、补齐缺项；第三方规则不会被触碰。
     pub fn set_policy_rules(&mut self, wanted: &[PolicyRule]) -> io::Result<()> {
         let mut first_err: Option<io::Error> = None;
 
-        let stale: Vec<PolicyRule> = self
-            .policy_rules
-            .iter()
-            .filter(|old| !wanted.contains(old))
-            .cloned()
-            .collect();
+        let current = self.dump_owned_policy_rules()?;
+        let mut found = vec![false; wanted.len()];
+        let mut stale = Vec::new();
+        for rule in current {
+            let matching = wanted.iter().enumerate().position(|(index, desired)| {
+                !found[index] && Self::policy_rule_matches(&rule, desired)
+            });
+            if let Some(index) = matching {
+                found[index] = true;
+            } else {
+                stale.push(rule);
+            }
+        }
+
+        let mut failed_priorities = std::collections::HashSet::new();
         for rule in stale {
             if let Err(e) = self.delete_policy_rule(&rule) {
                 warn!(
                     "[RouteManager] Failed to remove policy rule '{}' (priority {}): {e}",
                     rule.name, rule.priority
                 );
+                failed_priorities.insert(rule.priority);
                 if first_err.is_none() {
                     first_err = Some(e);
                 }
-                continue;
+            } else {
+                debug!(
+                    "[RouteManager] Removed stale owned policy rule '{}' (priority {})",
+                    rule.name, rule.priority
+                );
             }
-            self.policy_rules.retain(|r| r != &rule);
         }
 
-        for rule in wanted {
-            if self.policy_rules.contains(rule) {
+        let mut repaired = 0usize;
+        for (index, rule) in wanted.iter().enumerate() {
+            if found[index] || failed_priorities.contains(&rule.priority) {
                 continue;
             }
             match self.install_policy_rule(rule) {
-                Ok(()) => self.policy_rules.push(rule.clone()),
+                Ok(()) => repaired += 1,
                 Err(e) => {
                     warn!(
                         "[RouteManager] Failed to install policy rule '{}' (priority {}): {e}",
@@ -1066,10 +1105,215 @@ impl RouteManager {
             }
         }
 
+        if repaired > 0 {
+            info!("[RouteManager] Reinstalled {repaired} missing owned policy rule(s)");
+        }
+
         match first_err {
             Some(e) => Err(e),
             None => Ok(()),
         }
+    }
+
+    fn policy_rule_matches(actual: &PolicyRule, wanted: &PolicyRule) -> bool {
+        // name / ifindex are diagnostic metadata and are not encoded in fib rules.
+        actual.priority == wanted.priority
+            && actual.table == wanted.table
+            && actual.source == wanted.source
+            && actual.destination == wanted.destination
+            && actual.skip_mark_mask == wanted.skip_mark_mask
+            && actual.match_mark == wanted.match_mark
+            && actual.suppress_default == wanted.suppress_default
+    }
+
+    #[cfg(target_os = "linux")]
+    fn build_getrule_msg(seq: u32, family: u8) -> Vec<u8> {
+        let mut buffer: Vec<u8> = Vec::with_capacity(64);
+        buffer.extend_from_slice(&[0u8; NlMsgHdr::LEN]);
+        buffer.extend_from_slice(
+            &FibRuleHdr {
+                family,
+                dst_len: 0,
+                src_len: 0,
+                tos: 0,
+                table: 0,
+                action: 0,
+                flags: 0,
+            }
+            .to_bytes(),
+        );
+        Self::finish_msg(&mut buffer, RTM_GETRULE, NLM_F_REQUEST | NLM_F_DUMP, seq);
+        buffer
+    }
+
+    /// 转储并解析本程序策略规则。只选协议标记 77 和专属优先序段，避免接管第三方规则。
+    #[cfg(target_os = "linux")]
+    fn dump_owned_policy_rules(&mut self) -> io::Result<Vec<PolicyRule>> {
+        for attempt in 0..2 {
+            self.seq += 1;
+            let seq = self.seq;
+            let msg = Self::build_getrule_msg(seq, AF_INET);
+            let sent = unsafe {
+                libc::send(
+                    self.sock_fd,
+                    msg.as_ptr() as *const libc::c_void,
+                    msg.len(),
+                    0,
+                )
+            };
+            if sent < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if sent as usize != msg.len() {
+                return Err(io::Error::other("short netlink send for policy rule dump"));
+            }
+
+            let mut out = Vec::new();
+            let mut buf = [0u8; 8192];
+            let interrupted = 'outer: loop {
+                let n = unsafe {
+                    libc::recv(
+                        self.sock_fd,
+                        buf.as_mut_ptr() as *mut libc::c_void,
+                        buf.len(),
+                        0,
+                    )
+                };
+                if n < 0 {
+                    let e = io::Error::last_os_error();
+                    if e.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(e);
+                }
+                let len = n as usize;
+                let mut offset = 0usize;
+                while offset + NlMsgHdr::LEN <= len {
+                    let Some(hdr) = NlMsgHdr::from_bytes(&buf[offset..len]) else {
+                        break;
+                    };
+                    let msg_len = hdr.nlmsg_len as usize;
+                    if msg_len < NlMsgHdr::LEN || offset + msg_len > len {
+                        break;
+                    }
+                    if hdr.nlmsg_seq == seq && hdr.nlmsg_type == libc::NLMSG_DONE as u16 {
+                        break 'outer (hdr.nlmsg_flags & NLM_F_DUMP_INTR) != 0;
+                    }
+                    if hdr.nlmsg_seq == seq && hdr.nlmsg_type == libc::NLMSG_ERROR as u16 {
+                        let code = read_i32(&buf[offset..offset + msg_len], NlMsgHdr::LEN);
+                        return Err(match code {
+                            Some(c) if c < 0 => io::Error::from_raw_os_error(c.saturating_neg()),
+                            _ => io::Error::other("policy rule dump rejected by the kernel"),
+                        });
+                    }
+                    if hdr.nlmsg_seq == seq && hdr.nlmsg_type == RTM_NEWRULE {
+                        if let Some(rule) =
+                            Self::parse_owned_policy_rule(&buf[offset..offset + msg_len])
+                        {
+                            out.push(rule);
+                        }
+                    }
+                    offset += crate::netlink::util::nlmsg_align(msg_len);
+                }
+            };
+            if !interrupted {
+                return Ok(out);
+            }
+            if attempt == 1 {
+                return Err(io::Error::other(
+                    "policy rule dump remained interrupted after retry",
+                ));
+            }
+            debug!("[RouteManager] policy rule dump interrupted; retrying once");
+        }
+        unreachable!("policy rule dump loop returns or errors")
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn dump_owned_policy_rules(&mut self) -> io::Result<Vec<PolicyRule>> {
+        Ok(Vec::new())
+    }
+
+    fn parse_owned_policy_rule(buf: &[u8]) -> Option<PolicyRule> {
+        let body = NlMsgHdr::LEN;
+        if buf.len() < body + FibRuleHdr::LEN || buf[body] != AF_INET {
+            return None;
+        }
+        let dst_len = buf[body + 1];
+        let src_len = buf[body + 2];
+        if dst_len > 32
+            || src_len > 32
+            || buf[body + 7] != FR_ACT_TO_TBL
+            || read_u32(buf, body + 8)? != 0
+        {
+            return None;
+        }
+
+        let mut table = u32::from(buf[body + 4]);
+        let mut priority = None;
+        let mut source = None;
+        let mut destination = None;
+        let mut mark = None;
+        let mut mask = None;
+        let mut suppress_default = false;
+        let mut protocol = None;
+        let mut offset = body + FibRuleHdr::LEN;
+        while offset + RtAttr::LEN <= buf.len() {
+            let attr_len = read_u16(buf, offset)? as usize;
+            let attr_type = read_u16(buf, offset + 2)? & 0x3fff;
+            if attr_len < RtAttr::LEN || offset + attr_len > buf.len() {
+                return None;
+            }
+            let data = &buf[offset + RtAttr::LEN..offset + attr_len];
+            match attr_type {
+                FRA_TABLE => table = read_u32(data, 0)?,
+                FRA_PRIORITY => priority = read_u32(data, 0),
+                FRA_SRC if data.len() == 4 => {
+                    source = Some((Ipv4Addr::new(data[0], data[1], data[2], data[3]), src_len));
+                }
+                FRA_DST if data.len() == 4 => {
+                    destination =
+                        Some((Ipv4Addr::new(data[0], data[1], data[2], data[3]), dst_len));
+                }
+                FRA_FWMARK => mark = read_u32(data, 0),
+                FRA_FWMASK => mask = read_u32(data, 0),
+                FRA_SUPPRESS_PREFIXLEN => suppress_default = read_u32(data, 0)? == 0,
+                FRA_PROTOCOL => protocol = data.first().copied(),
+                _ => {}
+            }
+            offset += rta_align(attr_len);
+        }
+
+        let priority = priority?;
+        let in_reserved_band = (POLICY_RULE_PRIORITY_BASE
+            ..POLICY_RULE_PRIORITY_BASE + POLICY_SLOT_MAX)
+            .contains(&priority)
+            || (PBR_RULE_PRIORITY_BASE..PBR_RULE_PRIORITY_BASE + PBR_RULE_SLOT_MAX)
+                .contains(&priority);
+        if protocol != Some(PROBE_RULE_PROTOCOL) || !in_reserved_band {
+            return None;
+        }
+        let (skip_mark_mask, match_mark) = match (mark, mask) {
+            (Some(0), Some(mask)) => (Some(mask), None),
+            // Linux may omit FRA_FWMARK when its value is zero while still
+            // returning the non-zero FRA_FWMASK. The kernel's implicit mark
+            // value is zero, so preserve this as our zero-mark exemption rule.
+            (None, Some(mask)) => (Some(mask), None),
+            (Some(value), Some(mask)) => (None, Some((value, mask))),
+            (None, None) => (None, None),
+            _ => return None,
+        };
+        Some(PolicyRule {
+            name: "kernel-owned".to_string(),
+            ifindex: 0,
+            table,
+            priority,
+            source,
+            destination,
+            skip_mark_mask,
+            match_mark,
+            suppress_default,
+        })
     }
 
     fn install_policy_rule(&mut self, rule: &PolicyRule) -> io::Result<()> {
@@ -1107,10 +1351,12 @@ impl RouteManager {
     pub fn sweep_policy_rules(&mut self) -> io::Result<()> {
         let mut first_err: Option<io::Error> = None;
         let mut removed = 0usize;
-        for slot in 0..POLICY_SLOT_MAX {
-            match self.delete_own_rule_by_priority(POLICY_RULE_PRIORITY_BASE + slot) {
-                Ok(true) => removed += 1,
-                Ok(false) => {}
+        // One RTM_GETRULE dump finds every owned rule, including multiple
+        // source/destination expansions that share a priority. This avoids
+        // probing every reserved priority up to the maximum rule count.
+        for rule in self.dump_owned_policy_rules()? {
+            match self.delete_policy_rule(&rule) {
+                Ok(()) => removed += 1,
                 Err(e) => {
                     if first_err.is_none() {
                         first_err = Some(e);
@@ -1123,7 +1369,6 @@ impl RouteManager {
                 "[RouteManager] Removed {removed} leftover policy rule(s) from the reserved band"
             );
         }
-        self.policy_rules.clear();
         match first_err {
             Some(e) => Err(e),
             None => Ok(()),
@@ -3445,6 +3690,7 @@ mod tests {
         // 这些值照 linux/rtnetlink.h 与 fib_rules.h 钉死：抄错（如 NEWRULE=21、FRA_OIFNAME=10）会得到无上下文的 ENODEV。
         assert_eq!(RTM_NEWRULE, 32);
         assert_eq!(RTM_DELRULE, 33);
+        assert_eq!(RTM_GETRULE, 34);
         assert_eq!(FRA_PRIORITY, 6);
         assert_eq!(FRA_TABLE, 15);
         assert_eq!(FRA_OIFNAME, 17);
@@ -3739,6 +3985,9 @@ mod tests {
             priority: POLICY_RULE_PRIORITY_BASE + 2,
             source: Some(("192.168.3.0".parse().unwrap(), 24)),
             destination: Some(("10.0.0.0".parse().unwrap(), 8)),
+            skip_mark_mask: None,
+            match_mark: None,
+            suppress_default: false,
         };
         let msg = RouteManager::build_policy_rule_msg(
             11,
@@ -3765,6 +4014,61 @@ mod tests {
         assert_eq!(attrs[3].1, vec![10, 0, 0, 0]);
         assert_eq!(attrs[4].1, vec![PROBE_RULE_PROTOCOL]);
 
+        let pbr_rule = PolicyRule {
+            skip_mark_mask: Some(0x00ff0000),
+            ..rule.clone()
+        };
+        let msg = RouteManager::build_policy_rule_msg(
+            20,
+            &pbr_rule,
+            RTM_NEWRULE,
+            NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE,
+        );
+        let (_, masked_attrs) = parse_rule(&msg);
+        assert_eq!(
+            attr_types(&masked_attrs),
+            vec![
+                FRA_TABLE,
+                FRA_PRIORITY,
+                FRA_SRC,
+                FRA_DST,
+                FRA_FWMARK,
+                FRA_FWMASK,
+                FRA_PROTOCOL,
+            ]
+        );
+        assert_eq!(read_u32(&masked_attrs[4].1, 0), Some(0));
+        assert_eq!(read_u32(&masked_attrs[5].1, 0), Some(0x00ff0000));
+
+        // Kernel rule dumps may omit FRA_FWMARK for zero and return only the
+        // mask. Parsing must still recognize the rule as one of ours so stale
+        // rules can be reconciled and removed.
+        let mut mask_only_dump = vec![0u8; NlMsgHdr::LEN];
+        mask_only_dump.extend_from_slice(&parse_rule(&msg).0.to_bytes());
+        for (attr_type, data) in masked_attrs
+            .iter()
+            .filter(|(attr_type, _)| *attr_type != FRA_FWMARK)
+        {
+            RouteManager::append_attr(&mut mask_only_dump, *attr_type, data);
+        }
+        RouteManager::finish_msg(&mut mask_only_dump, RTM_NEWRULE, 0, 22);
+        let parsed = RouteManager::parse_owned_policy_rule(&mask_only_dump).unwrap();
+        assert_eq!(parsed.skip_mark_mask, Some(0x00ff0000));
+        assert_eq!(parsed.match_mark, None);
+
+        let adapter_rule = PolicyRule {
+            match_mark: Some((0x100, PBR_MARK_MASK)),
+            suppress_default: true,
+            ..rule.clone()
+        };
+        let msg =
+            RouteManager::build_policy_rule_msg(21, &adapter_rule, RTM_NEWRULE, NLM_F_REQUEST);
+        let (_, attrs) = parse_rule(&msg);
+        assert_eq!(read_u32(&attrs[4].1, 0), Some(0x100));
+        assert_eq!(read_u32(&attrs[5].1, 0), Some(PBR_MARK_MASK));
+        assert_eq!(attrs[6].0, FRA_SUPPRESS_PREFIXLEN);
+        assert_eq!(read_u32(&attrs[6].1, 0), Some(0));
+
         let any = PolicyRule {
             name: "all".to_string(),
             ifindex: 5,
@@ -3772,6 +4076,9 @@ mod tests {
             priority: POLICY_RULE_PRIORITY_BASE,
             source: None,
             destination: None,
+            skip_mark_mask: None,
+            match_mark: None,
+            suppress_default: false,
         };
         let msg = RouteManager::build_policy_rule_msg(
             12,
@@ -3793,6 +4100,7 @@ mod tests {
         assert!(POLICY_RULE_PRIORITY_BASE + POLICY_SLOT_MAX <= PROBE_RULE_PRIORITY_BASE);
         assert!(POLICY_RULE_PRIORITY_BASE > 0);
         assert!(POLICY_RULE_PRIORITY_BASE + POLICY_SLOT_MAX < PROBE_MAIN_ROUTE_METRIC);
+        assert!(PBR_RULE_PRIORITY_BASE + PBR_RULE_SLOT_MAX <= POLICY_RULE_PRIORITY_BASE);
     }
 
     #[test]

@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, 'feature/**']
   pull_request:
-    branches: [main, master]
+    branches: [main, master, 'feature/**']
   workflow_dispatch:
 
 env:
@@ -16,6 +16,36 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  generic-openwrt:
+    name: generic defaults / netifd / LuCI syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: POSIX shell syntax
+        run: sh -n openwrt/luci-app-mwan4/root/etc/init.d/mwan4 tests/generic-openwrt-init.sh
+      - name: LuCI JavaScript syntax
+        run: node --check openwrt/luci-app-mwan4/htdocs/luci-static/resources/view/mwan4/overview.js
+      - name: No-WAN and dynamic PPPoE regression tests
+        run: sh tests/generic-openwrt-init.sh
+      - name: PBR compatibility helper syntax
+        run: sh -n openwrt/mwan4-pbr-compat/files/usr/libexec/mwan4-pbr-compat
+      - name: Competing mwan3 mark owner regression
+        run: sh tests/pbr-mark-owner.sh
+      - name: Ensure no installer auto-starts mwan4
+        run: |
+          python - <<'PY'
+          import pathlib
+          script = pathlib.Path("scripts/build_packages.py").read_text()
+          assert '"/etc/init.d/mwan4 enable' not in script
+          assert '"/etc/init.d/mwan4 restart' not in script
+          assert 'build_mwan4_data_entries(bin_data, init_data, uci_config_data, json_config_data)' not in script
+          PY
+      - name: No preconfigured WAN in packaged UCI defaults
+        run: |
+          grep -q "^\s*option enabled '0'$" openwrt/luci-app-mwan4/root/etc/config/mwan4
+          ! grep -q "^config interface" openwrt/luci-app-mwan4/root/etc/config/mwan4
+          test "$(cat openwrt/luci-app-mwan4/root/lib/upgrade/keep.d/mwan4)" = "/etc/config/mwan4"
+
   # ── 品质关卡：格式、静态检查、单元测试 ────────────────────────────────
   quality:
     name: fmt / clippy / test
@@ -141,6 +171,8 @@ jobs:
           python scripts/build_packages.py --arch x86_64
           test -f dist/SHA256SUMS
           test -f dist/mwan4-x86_64-bundle.tar.gz
+          test -f dist/packages/mwan4-pbr-compat_0.2.2-r1_noarch.apk
+          test -f dist/packages/mwan4-pbr-compat_0.2.2-1_all.ipk
           ls -l dist/packages dist/SHA256SUMS
       - name: IPK control still validates (python)
         run: |
@@ -151,8 +183,44 @@ jobs:
               name = [n for n in t.getnames() if n.startswith("control.tar")][0]
               ctrl = tarfile.open(fileobj=io.BytesIO(t.extractfile(name).read()), mode="r:gz")
               assert "conffiles" in ctrl.getnames(), "IPK must declare conffiles"
+              data_name = [n for n in t.getnames() if n.startswith("data.tar")][0]
+              data = tarfile.open(fileobj=io.BytesIO(t.extractfile(data_name).read()), mode="r:gz")
+              keep = data.extractfile("lib/upgrade/keep.d/mwan4")
+              assert keep and keep.read() == b"/etc/config/mwan4\n", "IPK must preserve UCI config across sysupgrade"
           print("OK", ipk)
+          addon = "dist/packages/mwan4-pbr-compat_0.2.2-1_all.ipk"
+          with tarfile.open(addon, "r:gz") as t:
+              ctrl = tarfile.open(fileobj=io.BytesIO(t.extractfile("control.tar.gz").read()), mode="r:gz")
+              assert "postinst" not in ctrl.getnames(), "addon must not auto-start services"
+              data = tarfile.open(fileobj=io.BytesIO(t.extractfile("data.tar.gz").read()), mode="r:gz")
+              assert "lib/mwan4/mwan4.uc" in data.getnames()
+              assert "lib/mwan4/pbr_render.uc" in data.getnames()
+          with tarfile.open("dist/mwan4-x86_64-bundle.tar.gz", "r:gz") as t:
+              assert not any("pbr" in name for name in t.getnames()), "base bundle must keep PBR opt-in"
+              keep = t.extractfile("lib/upgrade/keep.d/mwan4")
+              assert keep and keep.read() == b"/etc/config/mwan4\n", "bundle must preserve UCI config across sysupgrade"
           PY
+
+  kernel-netns:
+    name: privileged kernel ECMP / PBR / rollback regression
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: iproute2 network namespace regression
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends iproute2 nftables iputils-ping cmake libjson-c-dev
+          git init /tmp/mwan4-ucode
+          git -C /tmp/mwan4-ucode fetch --depth 1 https://github.com/jow-/ucode.git 703b3b399ba18087e1407446f578fbb4f07cd616
+          git -C /tmp/mwan4-ucode checkout --detach FETCH_HEAD
+          cmake -S /tmp/mwan4-ucode -B /tmp/mwan4-ucode/build -DUCI_SUPPORT=OFF -DUBUS_SUPPORT=OFF -DULOOP_SUPPORT=OFF
+          cmake --build /tmp/mwan4-ucode/build -j2
+          UCODE=/tmp/mwan4-ucode/build/ucode
+          LIB="$PWD/openwrt/mwan4-pbr-compat/files/lib/mwan4"
+          for file in "$LIB"/*.uc; do "$UCODE" -S -c -o /tmp/mwan4-ucode-test.out "$file"; done
+          "$UCODE" -S -L /tmp/mwan4-ucode/build -L "$LIB" tests/pbr-render.uc /tmp/mwan4-pbr-test.nft
+          "$UCODE" -S -L "$LIB" tests/pbr-api.uc
+          sudo sh tests/netns-kernel-ecmp-pbr.sh /tmp/mwan4-pbr-test.nft
 
   # ── 真实核心 netns 整合测试（advisory）────────────────────────────────
   # GitHub runner 对 unprivileged userns 有 AppArmor 限制时会直接跑不起来，
@@ -176,9 +244,22 @@ jobs:
       - name: Build tests
         run: cargo test --locked --no-run
 
-      - name: Run netns route lifecycle tests
+      - name: Run Rust netns integration with isolated privileged network namespace
         run: |
-          unshare -Urn sh -c             'MWAN4_NETNS_TEST=1 cargo test --offline -- --ignored netns --test-threads=1'
+          set -euo pipefail
+          # Hosted runners restrict unprivileged userns (unshare -Urn).
+          # Root-created ip-netns already works in the dedicated kernel job.
+          sudo apt-get update
+          sudo apt-get install -y iproute2
+          NS="mwan4-rust-${{ github.run_id }}-$"
+          cleanup() { sudo ip netns del "$NS" 2>/dev/null || :; }
+          trap cleanup EXIT
+          sudo ip netns add "$NS"
+          sudo ip netns exec "$NS" ip link set lo up
+          sudo ip netns exec "$NS" env \
+            "HOME=$HOME" "PATH=$PATH" "CARGO_HOME=$CARGO_HOME" \
+            RUST_BACKTRACE=1 MWAN4_NETNS_TEST=1 \
+            cargo test --offline -- --ignored netns --test-threads=1
 
   # ── MSRV 守门：确保 Cargo.toml 宣告的 rust-version 真的能编过 ─────────
   # Cargo.toml 使用 edition 2024 并宣告 rust-version = "1.85"。

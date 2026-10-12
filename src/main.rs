@@ -63,6 +63,32 @@ OPTIONS:
     );
 }
 
+/// Different MWAN4 member metrics intentionally create primary/backup tiers.
+/// Make that choice visible at startup so a user expecting ECMP does not mistake
+/// a healthy standby WAN for a daemon or link failure.
+fn warn_on_metric_tiers(config: &DaemonConfig) {
+    let mut tiers = std::collections::BTreeMap::<u32, Vec<&str>>::new();
+    for iface in &config.interfaces {
+        tiers
+            .entry(iface.metric)
+            .or_default()
+            .push(iface.name.as_str());
+    }
+
+    if tiers.len() < 2 {
+        return;
+    }
+
+    let summary = tiers
+        .into_iter()
+        .map(|(metric, names)| format!("{metric} [{}]", names.join(", ")))
+        .collect::<Vec<_>>()
+        .join("; ");
+    warn!(
+        "Configured MWAN4 member metrics form multiple priority tiers ({summary}). Only the lowest metric tier participates in ECMP; higher tiers are primary/backup by design. Set the same MWAN4 member metric on every WAN to load-balance all of them together. This is separate from netifd network.interface metrics."
+    );
+}
+
 /// 行程存活期间一直持有；行程结束由核心自动释放。
 static PID_FILE_LOCK: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
 
@@ -573,7 +599,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(path) = check_config_path {
         match DaemonConfig::load_from_file(&path) {
-            Ok(_) => {
+            Ok(config) => {
+                warn_on_metric_tiers(&config);
                 println!("Configuration OK: {path}");
                 return Ok(());
             }
@@ -609,6 +636,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     };
+
+    warn_on_metric_tiers(&config);
 
     if config.probe_timeout_ms > config.check_interval_ms {
         warn!(
@@ -1894,7 +1923,7 @@ struct InterfaceStatus {
     tx_bps: f64,
     rx_bps: f64,
     load_pct: Option<f64>,
-    offloaded: bool,
+    load_shifted: bool,
     rtt_ms: f64,
     jitter_ms: f64,
     loss_rate: f64,
@@ -2394,9 +2423,47 @@ fn build_policy_rules(config: &DaemonConfig, monitors: &[WanMonitor]) -> Vec<Pol
                     priority,
                     source: *source,
                     destination: *destination,
+                    skip_mark_mask: config.policy_skip_mark_mask,
+                    match_mark: None,
+                    suppress_default: false,
                 });
             }
         }
+    }
+    // Keep a rule even when a preferred WAN is unhealthy: matching PBR flows
+    // must return to ECMP rather than fall through to an overlapping native
+    // policy. Probe tables remain available while a WAN is being monitored.
+    for (index, target) in config.pbr_targets.iter().enumerate() {
+        let healthy = target.interface.as_ref().and_then(|iface| {
+            monitors.iter().find(|m| {
+                &m.ifname == iface
+                    && m.ifindex != 0
+                    && m.lqe.state == LinkState::Up
+                    && !m.lqe.is_degraded()
+                    && !m.probe_path_missing
+            })
+        });
+        let table = healthy
+            .and_then(|m| config.interfaces.iter().position(|i| i.name == m.ifname))
+            .map_or(254, |slot| PROBE_TABLE_BASE + slot as u32);
+        let rule = PolicyRule {
+            name: format!("pbr:{}", target.name),
+            ifindex: healthy.map_or(0, |m| m.ifindex),
+            table,
+            priority: netlink::route::PBR_RULE_PRIORITY_BASE + index as u32 * 2 + 1,
+            source: None,
+            destination: None,
+            skip_mark_mask: None,
+            match_mark: Some((target.mark, netlink::route::PBR_MARK_MASK)),
+            suppress_default: false,
+        };
+        rules.push(PolicyRule {
+            table: 254,
+            priority: rule.priority - 1,
+            suppress_default: true,
+            ..rule.clone()
+        });
+        rules.push(rule);
     }
     rules
 }
@@ -2523,7 +2590,7 @@ fn write_status_file(
             tx_bps: (m.tx_bps * 100.0).round() / 100.0,
             rx_bps: (m.rx_bps * 100.0).round() / 100.0,
             load_pct: load_utilization(m).map(|u| (u * 10000.0).round() / 100.0),
-            offloaded: m.load_pressure_active,
+            load_shifted: m.load_pressure_active,
             rtt_ms: (m.lqe.rtt_ewma_ms.unwrap_or(0.0) * 100.0).round() / 100.0,
             jitter_ms: (m.lqe.jitter_ewma_ms * 100.0).round() / 100.0,
             loss_rate: (m.lqe.loss_rate() * 10000.0).round() / 100.0,
@@ -2723,8 +2790,13 @@ mod tests {
     #[test]
     #[ignore]
     fn netns_hash_policy_drift_repair() {
-        if std::env::var("MWAN4_NETNS_TEST").as_deref() != Ok("1") {
-            eprintln!("skip: set MWAN4_NETNS_TEST=1 and run inside `unshare -Urn`");
+        let requested = std::env::var("MWAN4_NETNS_TEST").as_deref() == Ok("1");
+        let isolated = std::fs::read_link("/proc/self/ns/net")
+            .ok()
+            .zip(std::fs::read_link("/proc/1/ns/net").ok())
+            .is_some_and(|(current, init)| current != init);
+        if !requested || !isolated {
+            eprintln!("skip: tests require MWAN4_NETNS_TEST=1 AND isolated network namespace");
             return;
         }
         let original = read_effective_hash_v4();
@@ -3319,5 +3391,41 @@ mod tests {
         let wildcard = rules.iter().find(|r| r.name == "dead").unwrap();
         assert_eq!(wildcard.source, None);
         assert_eq!(wildcard.destination, None);
+    }
+
+    #[test]
+    fn test_pbr_targets_follow_health_and_keep_ecmp_fallback() {
+        let mut cfg = DaemonConfig::default();
+        cfg.interfaces[0].name = "wan1".into();
+        cfg.pbr_targets = vec![
+            config::PbrTarget {
+                name: "balanced".into(),
+                mark: 0x3f00,
+                interface: None,
+            },
+            config::PbrTarget {
+                name: "prefer".into(),
+                mark: 0x100,
+                interface: Some("wan1".into()),
+            },
+        ];
+        let mut m = monitor("wan1", None);
+        m.ifindex = 11;
+        m.lqe.state = LinkState::Up;
+        m.probe_path_missing = false;
+        let up = build_policy_rules(&cfg, std::slice::from_ref(&m));
+        assert_eq!(up.len(), 4);
+        assert_eq!(up[0].table, 254);
+        assert!(up[0].suppress_default);
+        assert_eq!(up[1].table, 254);
+        assert_eq!(up[3].table, PROBE_TABLE_BASE);
+        assert_eq!(up[3].match_mark, Some((0x100, 0x3f00)));
+        m.lqe.state = LinkState::Down;
+        let down = build_policy_rules(&cfg, std::slice::from_ref(&m));
+        assert_eq!(down.len(), 4, "retain fallback before native policies");
+        assert_eq!(down[3].table, 254);
+        m.lqe.state = LinkState::Up;
+        m.probe_path_missing = true;
+        assert_eq!(build_policy_rules(&cfg, &[m])[3].table, 254);
     }
 }
