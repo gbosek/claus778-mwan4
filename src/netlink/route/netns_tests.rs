@@ -760,7 +760,7 @@ fn netns_policy_routing() {
         skip_mark_mask: Some(0x00ff0000),
         ..rule.clone()
     };
-    rm.set_policy_rules(&[masked])
+    rm.set_policy_rules(std::slice::from_ref(&masked))
         .expect("enable PBR mark exemption");
     let pbr_hit = sh_out(&[
         "ip",

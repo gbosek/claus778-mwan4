@@ -1294,7 +1294,7 @@ impl RouteManager {
             return None;
         }
         let (skip_mark_mask, match_mark) = match (mark, mask) {
-            (Some(value), Some(mask)) if value == 0 => (Some(mask), None),
+            (Some(0), Some(mask)) => (Some(mask), None),
             (Some(value), Some(mask)) => (None, Some((value, mask))),
             (None, None) => (None, None),
             _ => return None,
