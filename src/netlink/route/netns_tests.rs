@@ -776,6 +776,24 @@ fn netns_policy_routing() {
         pbr_hit.contains("dev mwp0"),
         "PBR mark did not win: {pbr_hit}"
     );
+
+    // A firewall/PBR reload or external hotplug helper can remove our rule
+    // without changing daemon memory. The periodic sync must inspect kernel
+    // state and recreate the missing exception instead of trusting a cache.
+    assert!(sh(&["ip", "rule", "del", "pref", "9000", "protocol", "77"]));
+    let removed = sh_out(&["ip", "rule", "show"]);
+    assert!(
+        !removed.contains("fwmark 0x0/0xff0000"),
+        "test setup failed to remove the owned rule:\n{removed}"
+    );
+    rm.set_policy_rules(std::slice::from_ref(&masked))
+        .expect("reconcile externally removed policy rule");
+    let restored = sh_out(&["ip", "rule", "show"]);
+    assert!(
+        restored.contains("fwmark 0x0/0xff0000 lookup 10001"),
+        "missing owned rule was not restored from kernel state:\n{restored}"
+    );
+
     let native_hit = sh_out(&["ip", "route", "get", "8.8.8.8", "from", "192.168.9.5"]);
     assert!(
         native_hit.contains("dev mwp1"),
@@ -828,12 +846,42 @@ fn netns_policy_routing() {
         .expect("install two rules on the same priority");
     let rules = sh_out(&["ip", "rule", "show"]);
     assert!(rules.contains("192.168.9.0/24") && rules.contains("192.168.8.0/24"));
+
+    // The protocol tag and reserved band isolate cleanup from other managers.
+    assert!(sh(&[
+        "ip",
+        "rule",
+        "add",
+        "pref",
+        "9000",
+        "from",
+        "192.168.7.0/24",
+        "lookup",
+        "10001",
+        "protocol",
+        "99",
+    ]));
     rm.sweep_policy_rules().expect("sweep every expanded rule");
     let rules = sh_out(&["ip", "rule", "show"]);
     assert!(
         !rules.contains("192.168.9.0/24") && !rules.contains("192.168.8.0/24"),
         "sweep left behind same-priority policy rule(s):\n{rules}"
     );
+    assert!(
+        rules.contains("192.168.7.0/24"),
+        "cleanup removed a rule owned by another routing manager:\n{rules}"
+    );
+    assert!(sh(&[
+        "ip",
+        "rule",
+        "del",
+        "pref",
+        "9000",
+        "from",
+        "192.168.7.0/24",
+        "protocol",
+        "99",
+    ]));
 
     // The PBR consumer mark must beat an overlapping native source policy.
     // Specific main routes (LAN/VPN/connected) are protected from a WAN default.

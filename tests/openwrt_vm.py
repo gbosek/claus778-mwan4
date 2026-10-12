@@ -517,6 +517,28 @@ class Lab:
         self.cmd("nft list ruleset | grep -q '198.18.0.0/15'")
         self.cmd("nft list ruleset | grep -q 'goto mwan4_strategy_dhcpwan_prefer_ipv4'")
         self.cmd("ip -4 route get 198.18.0.1 from 192.0.2.10 mark 0x200 | grep -q 'table 10001'")
+
+        # Reproduce a hotplug/PBR reload that removes an owned fwmark rule
+        # without notifying the daemon. The next kernel-state reconciliation
+        # heartbeat must restore it and the marked route must work again.
+        strategy_rules = self.cmd("ip -4 rule show")
+        strategy_rule = next(
+            (
+                line
+                for line in strategy_rules.splitlines()
+                if re.search(r"fwmark\s+0x200/0x3f00\s+lookup\s+10001", line)
+            ),
+            None,
+        )
+        if strategy_rule is None:
+            raise AssertionError(f"missing DHCP strategy rule before deletion:\n{strategy_rules}")
+        strategy_priority = strategy_rule.split(":", 1)[0].strip()
+        self.cmd(f"ip -4 rule del pref {strategy_priority} protocol 77")
+        self.cmd("! ip -4 rule show | grep -q 'fwmark 0x200/0x3f00 lookup 10001'")
+        self.wait("ip -4 rule show | grep -q 'fwmark 0x200/0x3f00 lookup 10001'", 75)
+        self.cmd("ip -4 route get 198.18.0.1 from 192.0.2.10 mark 0x200 | grep -q 'table 10001'")
+        self.checkpoint("PASS: deleted MWAN4 PBR rule was reconciled and restored")
+
         self.cmd("/etc/init.d/firewall reload", 40)
         self.cmd("nft list ruleset | grep -q 'goto mwan4_strategy_dhcpwan_prefer_ipv4'")
         self.checkpoint("PASS: actual upstream PBR 1.2.3 strategy target and fw4 reload")
